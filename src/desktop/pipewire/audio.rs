@@ -55,6 +55,8 @@ pub struct CaptureConfig {
     pub format: AudioFormat,
     /// Frames per buffer (default: 1024, ~21ms at 48kHz)
     pub buffer_frames: u32,
+    /// Optional PipeWire remote name or absolute socket path.
+    pub remote_name: Option<String>,
 }
 
 impl Default for CaptureConfig {
@@ -64,6 +66,7 @@ impl Default for CaptureConfig {
             channels: 2,
             format: AudioFormat::F32,
             buffer_frames: 1024,
+            remote_name: None,
         }
     }
 }
@@ -119,6 +122,11 @@ pub struct AudioCaptureHandle {
 }
 
 impl AudioCaptureHandle {
+    /// Clone the thread-safe stop signal for connection-owned tasks.
+    pub fn stop_signal(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop_signal)
+    }
+
     /// Signal the capture thread to stop
     pub fn stop(&self) {
         self.stop_signal.store(true, Ordering::SeqCst);
@@ -184,8 +192,13 @@ impl AudioCapture {
             pw::main_loop::MainLoopBox::new(None).context("Failed to create PipeWire MainLoop")?;
         let context = pw::context::ContextBox::new(mainloop.loop_(), None)
             .context("Failed to create PipeWire Context")?;
+        let remote_properties = self.config.remote_name.as_ref().map(|remote| {
+            pw::properties::properties! {
+                *pw::keys::REMOTE_NAME => remote.as_str()
+            }
+        });
         let core = context
-            .connect(None)
+            .connect(remote_properties)
             .context("Failed to connect to PipeWire daemon")?;
 
         let mut props = pw::properties::properties! {
