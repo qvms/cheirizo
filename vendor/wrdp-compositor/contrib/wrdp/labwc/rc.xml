@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<wrdp_compositor_config>
+  <core>
+    <gap>0</gap>
+    <adaptiveSync>no</adaptiveSync>
+  </core>
+  <theme>
+    <name>PlatinumTheme-wrdp-compositor</name>
+    <cornerRadius>0</cornerRadius>
+    <titlebar>
+      <layout>close:shade,max</layout>
+    </titlebar>
+    <font place="ActiveWindow"><name>Charcoal</name><size>14</size><weight>normal</weight></font>
+    <font place="InactiveWindow"><name>Charcoal</name><size>14</size><weight>normal</weight></font>
+    <font place="MenuHeader"><name>Charcoal</name><size>11</size></font>
+    <font place="MenuItem"><name>Charcoal</name><size>11</size></font>
+    <font place="OnScreenDisplay"><name>Charcoal</name><size>11</size></font>
+  </theme>
+  <keyboard>
+    <keybind key="A-Tab"><action name="NextWindow"/></keybind>
+    <keybind key="A-S-Tab"><action name="PreviousWindow"/></keybind>
+    <keybind key="A-F4"><action name="Close"/></keybind>
+    <keybind key="A-F12"><action name="ToggleShade"/></keybind>
+    <keybind key="A-space"><action name="ShowMenu"><menu>client-menu</menu></action></keybind>
+    <keybind key="W-Return"><action name="Execute"><command>foot</command></action></keybind>
+    <keybind key="W-d"><action name="Execute"><command>foot</command></action></keybind>
+  </keyboard>
+  <mouse>
+    <!-- Load wrdp-compositor defaults: click-to-focus/raise, titlebar/frame drag,
+         edge/corner resize, window menu, scroll-wheel desktop switching, etc. -->
+    <default />
+
+    <!-- RDP-friendly extras: move/resize any window from its client area. -->
+    <context name="Frame">
+      <mousebind button="A-Left" action="Press">
+        <action name="Focus" />
+        <action name="Raise" />
+      </mousebind>
+      <mousebind button="A-Left" action="Drag">
+        <action name="Move" />
+      </mousebind>
+      <mousebind button="A-Right" action="Press">
+        <action name="Focus" />
+        <action name="Raise" />
+      </mousebind>
+      <mousebind button="A-Right" action="Drag">
+        <action name="Resize" />
+      </mousebind>
+    </context>
+
+    <context name="Title">
+      <mousebind button="Left" action="DoubleClick"><action name="ToggleShade"/></mousebind>
+    </context>
+
+    <context name="Root">
+      <mousebind button="Right" action="Press"><action name="ShowMenu"><menu>root-menu</menu></action></mousebind>
+    </context>
+  </mouse>
+
+
+</wrdp_compositor_config>

@@ -1,0 +1,12 @@
+/target/
+/build/
+/vendor/wrdp-compositor/build/
+.agents.local.md
+.env
+.env.local
+.local/
+*.log
+*.tmp
+.DS_Store
+.vscode/
+.idea/

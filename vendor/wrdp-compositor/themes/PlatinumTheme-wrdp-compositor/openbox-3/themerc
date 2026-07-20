@@ -1,0 +1,58 @@
+# PlatinumTheme-wrdp-compositor
+# Supported-key wrdp-compositor 0.8.3 theme. wrdp-compositor does not parse Openbox texture/pixmap
+# declarations for frame/titlebar backgrounds, so keep this to real keys.
+
+border.width: 9
+padding.width: 2
+padding.height: 1
+window.title.height: 33
+window.button.width: 20
+window.button.height: 20
+window.button.spacing: 5
+window.titlebar.padding.width: 0
+window.titlebar.padding.height: 0
+window.titlebar.button.padding: 0
+window.handle.width: 5
+
+window.active.border.color: #000000
+window.inactive.border.color: #5c5c5c
+window.active.client.color: #d6d3ce
+window.inactive.client.color: #d6d3ce
+window.active.title.bg.color: #e2e5e2
+window.inactive.title.bg.color: #d8dbd8
+window.active.label.text.color: #0e0e0e
+window.inactive.label.text.color: #575757
+window.label.text.justify: center
+window.active.handle.bg.color: #bdbab4
+window.inactive.handle.bg.color: #d6d3ce
+window.active.grip.bg.color: #6d6d6d
+window.inactive.grip.bg.color: #a0a0a0
+
+window.active.button.unpressed.image.color: #000000
+window.active.button.hover.image.color: #000000
+window.active.button.disabled.image.color: #8a8a8a
+window.inactive.button.unpressed.image.color: #555555
+window.inactive.button.hover.image.color: #000000
+window.inactive.button.disabled.image.color: #9a9a9a
+window.active.button.hover.bg.color: #bdbab4
+window.inactive.button.hover.bg.color: #bdbab4
+window.button.hover.bg.corner-radius: 0
+
+menu.border.width: 1
+menu.border.color: #5a5a5a
+menu.items.bg.color: #d6d3ce
+menu.items.text.color: #000000
+menu.items.disabled.text.color: #777777
+menu.items.active.bg.color: #164a9b
+menu.items.active.text.color: #ffffff
+menu.title.bg.color: #bdbab4
+menu.title.text.color: #000000
+menu.title.text.justify: center
+menu.separator.color: #8f8f8f
+
+osd.bg.color: #d6d3ce
+osd.border.color: #5a5a5a
+osd.label.text.color: #000000
+osd.active.label.bg.color: #164a9b
+osd.active.label.text.color: #ffffff
+window.active.indicator.toggled-keybind.color: #164a9b

@@ -1,0 +1,4 @@
+# wrdp compositor session autostart
+# Set a sane default desktop size before the RDP server captures the output.
+wlr-randr --output HEADLESS-1 --custom-mode 1920x1080 || true
+foot --window-size-pixels=828x380 --title="~/Desktop" sh -lc 'printf "\033]0;~/Desktop\007"; clear; exec sh' &

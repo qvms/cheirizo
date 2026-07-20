@@ -1,0 +1,146 @@
+{
+  "W": 244,
+  "H": 22,
+  "rects": [
+    {
+      "name": "close-active.xpm",
+      "x": 0,
+      "y": 0,
+      "w": 13,
+      "h": 13
+    },
+    {
+      "name": "close-inactive.xpm",
+      "x": 14,
+      "y": 0,
+      "w": 13,
+      "h": 13
+    },
+    {
+      "name": "hide-active.xpm",
+      "x": 28,
+      "y": 0,
+      "w": 13,
+      "h": 13
+    },
+    {
+      "name": "hide-inactive.xpm",
+      "x": 42,
+      "y": 0,
+      "w": 13,
+      "h": 13
+    },
+    {
+      "name": "maximize-active.xpm",
+      "x": 56,
+      "y": 0,
+      "w": 13,
+      "h": 13
+    },
+    {
+      "name": "maximize-inactive.xpm",
+      "x": 70,
+      "y": 0,
+      "w": 13,
+      "h": 13
+    },
+    {
+      "name": "menu-active.xpm",
+      "x": 84,
+      "y": 0,
+      "w": 13,
+      "h": 13
+    },
+    {
+      "name": "menu-inactive.xpm",
+      "x": 98,
+      "y": 0,
+      "w": 13,
+      "h": 13
+    },
+    {
+      "name": "title-1-active.xpm",
+      "x": 112,
+      "y": 0,
+      "w": 7,
+      "h": 22
+    },
+    {
+      "name": "title-2-active.xpm",
+      "x": 120,
+      "y": 0,
+      "w": 7,
+      "h": 22
+    },
+    {
+      "name": "title-3-active.xpm",
+      "x": 128,
+      "y": 0,
+      "w": 7,
+      "h": 22
+    },
+    {
+      "name": "title-4-active.xpm",
+      "x": 136,
+      "y": 0,
+      "w": 7,
+      "h": 22
+    },
+    {
+      "name": "title-5-active.xpm",
+      "x": 144,
+      "y": 0,
+      "w": 7,
+      "h": 22
+    },
+    {
+      "name": "top-left-active.xpm",
+      "x": 152,
+      "y": 0,
+      "w": 21,
+      "h": 22
+    },
+    {
+      "name": "top-right-active.xpm",
+      "x": 174,
+      "y": 0,
+      "w": 36,
+      "h": 22
+    },
+    {
+      "name": "left-active.xpm",
+      "x": 211,
+      "y": 0,
+      "w": 6,
+      "h": 5
+    },
+    {
+      "name": "right-active.xpm",
+      "x": 218,
+      "y": 0,
+      "w": 6,
+      "h": 5
+    },
+    {
+      "name": "bottom-left-active.xpm",
+      "x": 225,
+      "y": 0,
+      "w": 6,
+      "h": 6
+    },
+    {
+      "name": "bottom-active.xpm",
+      "x": 232,
+      "y": 0,
+      "w": 5,
+      "h": 6
+    },
+    {
+      "name": "bottom-right-active.xpm",
+      "x": 238,
+      "y": 0,
+      "w": 6,
+      "h": 6
+    }
+  ]
+}

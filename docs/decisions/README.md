@@ -1,0 +1,14 @@
+# Architecture decisions
+
+| ADR | Decision | Status |
+|---|---|---|
+| [0001](0001-separate-server-and-session-manager.md) | Separate the RDP frontend from per-user desktop lifecycle management | accepted |
+| [0002](0002-use-ironrdp-for-the-protocol-core.md) | Use IronRDP for RDP protocol state machines | accepted |
+| [0003](0003-own-managed-wayland-sessions.md) | Create and own managed Wayland sessions | accepted |
+| [0004](0004-prefer-egfx-with-bitmap-fallback.md) | Prefer EGFX/H.264 and keep bitmap fallback | accepted |
+| [0005](0005-bundle-a-managed-compositor.md) | Bundle the managed compositor as a separate GPL program | accepted |
+| [0006](0006-pin-ironrdp-revisions.md) | Pin one tested IronRDP revision | accepted |
+| [0007](0007-separate-authentication-from-session-binding.md) | Separate credential validation from session binding | accepted |
+| [0008](0008-use-ini-configuration.md) | Use INI files for server and session-manager configuration | accepted |
+| [0009](0009-persist-session-process-identity.md) | Persist PID reuse-safe process identity for sessions | accepted |
+| [0010](0010-use-one-server-lifecycle.md) | Use one RDP listener and connection lifecycle | accepted |

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=wrdp-compositor
+Comment=A wayland stacking compositor
+Exec=/usr/lib/wrdp/wrdp-compositor --config-dir /etc/wrdp/labwc
+Icon=wrdp-compositor
+Type=Application
+DesktopNames=wrdp-compositor;wlroots

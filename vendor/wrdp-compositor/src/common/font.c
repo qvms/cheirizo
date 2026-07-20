@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* WRDP modifications, 2026. */
+#include <cairo.h>
+#include <drm_fourcc.h>
+#include <pango/pangocairo.h>
+#include <wlr/render/wlr_renderer.h>
+#include <wlr/util/box.h>
+#include <wlr/util/log.h>
+#include "common/font.h"
+#include "common/graphic-helpers.h"
+#include "common/string-helpers.h"
+#include "wrdp-compositor.h"
+#include "buffer.h"
+
+
+static bool
+os9_platinum_charcoal_title(struct font *font)
+{
+	return rc.theme_name && strstr(rc.theme_name, "Platinum")
+		&& font && font->name && !strcmp(font->name, "Charcoal")
+		&& font->size == 22;
+}
+
+static void
+os9_apply_charcoal_title_attrs(PangoLayout *layout, struct font *font)
+{
+	if (!os9_platinum_charcoal_title(font)) {
+		return;
+	}
+	PangoAttrList *attrs = pango_attr_list_new();
+	/* Add ~0.25 px between glyphs; enough to recover the missing 2 px
+	 * title span without horizontally scaling the glyph shapes. */
+	PangoAttribute *letter = pango_attr_letter_spacing_new(208);
+	letter->start_index = 0;
+	letter->end_index = G_MAXUINT;
+	pango_attr_list_insert(attrs, letter);
+	pango_layout_set_attributes(layout, attrs);
+	pango_attr_list_unref(attrs);
+}
+
+PangoFontDescription *
+font_to_pango_desc(struct font *font)
+{
+	PangoFontDescription *desc = pango_font_description_new();
+	pango_font_description_set_family(desc, font->name);
+	pango_font_description_set_size(desc, font->size * PANGO_SCALE);
+	if (font->slant == FONT_SLANT_ITALIC) {
+		pango_font_description_set_style(desc, PANGO_STYLE_ITALIC);
+	}
+	if (font->slant == FONT_SLANT_OBLIQUE) {
+		pango_font_description_set_style(desc, PANGO_STYLE_OBLIQUE);
+	}
+	if (font->weight == FONT_WEIGHT_BOLD) {
+		pango_font_description_set_weight(desc, PANGO_WEIGHT_BOLD);
+	}
+	return desc;
+}
+
+static PangoRectangle
+font_extents(struct font *font, const char *string)
+{
+	PangoRectangle rect = { 0 };
+	if (!string) {
+		return rect;
+	}
+	cairo_surface_t *surface;
+	cairo_t *c;
+	PangoLayout *layout;
+
+	surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+	c = cairo_create(surface);
+	layout = pango_cairo_create_layout(c);
+	pango_context_set_round_glyph_positions(pango_layout_get_context(layout), false);
+	PangoFontDescription *desc = font_to_pango_desc(font);
+
+	pango_layout_set_font_description(layout, desc);
+	pango_layout_set_text(layout, string, -1);
+	os9_apply_charcoal_title_attrs(layout, font);
+	pango_layout_set_single_paragraph_mode(layout, TRUE);
+	pango_layout_set_width(layout, -1);
+	pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_MIDDLE);
+	pango_layout_get_extents(layout, NULL, &rect);
+	pango_extents_to_pixels(&rect, NULL);
+
+	/* we put a 2 px edge on each side - because Openbox does it :) */
+	/* TODO: remove the 4 pixel addition and always do the padding by the caller */
+	rect.width += 4;
+
+	cairo_destroy(c);
+	cairo_surface_destroy(surface);
+	pango_font_description_free(desc);
+	g_object_unref(layout);
+	return rect;
+}
+
+int
+font_height(struct font *font)
+{
+	PangoRectangle rectangle = font_extents(font, "abcdefg");
+	return rectangle.height;
+}
+
+int
+font_width(struct font *font, const char *string)
+{
+	PangoRectangle rectangle = font_extents(font, string);
+	return rectangle.width;
+}
+
+void
+font_get_buffer_size(int max_width, const char *text, struct font *font,
+	int *width, int *height)
+{
+	PangoRectangle text_extents = font_extents(font, text);
+	if (max_width > 0 && text_extents.width > max_width) {
+		text_extents.width = max_width;
+	}
+	*width = text_extents.width;
+	*height = text_extents.height;
+}
+
+void
+font_buffer_create(struct lab_data_buffer **buffer, int max_width,
+	const char *text, struct font *font, const float *color,
+	const float *bg_color, double scale)
+{
+	if (string_null_or_empty(text)) {
+		return;
+	}
+
+	int width, height;
+	font_get_buffer_size(max_width, text, font, &width, &height);
+
+	*buffer = buffer_create_cairo(width, height, scale);
+	if (!*buffer) {
+		wlr_log(WLR_ERROR, "Failed to create font buffer");
+		return;
+	}
+
+	cairo_surface_t *surf = (*buffer)->surface;
+	cairo_t *cairo = cairo_create(surf);
+
+	/*
+	 * Fill with the background color first IF the background color
+	 * is opaque. This is necessary for subpixel rendering to work
+	 * properly (it does not work on top of transparency).
+	 *
+	 * However, if the background color is not opaque, leave the
+	 * buffer unfilled (completely transparent) since the background
+	 * is already rendered by the scene element underneath. In this
+	 * case we have to disable subpixel rendering.
+	 *
+	 * Note: the 0.999 cutoff was chosen to be greater than 254/255
+	 * (about 0.996) but leave some margin for rounding errors.
+	 */
+	bool opaque_bg = (bg_color[3] > 0.999f);
+	if (opaque_bg) {
+		set_cairo_color(cairo, bg_color);
+		cairo_paint(cairo);
+	}
+
+	set_cairo_color(cairo, color);
+	cairo_move_to(cairo, 0, 0);
+
+	PangoLayout *layout = pango_cairo_create_layout(cairo);
+	pango_context_set_round_glyph_positions(pango_layout_get_context(layout), false);
+	pango_layout_set_width(layout, width * PANGO_SCALE);
+	pango_layout_set_text(layout, text, -1);
+	os9_apply_charcoal_title_attrs(layout, font);
+	pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+
+	if (!opaque_bg || os9_platinum_charcoal_title(font)) {
+		/* Transparent buffers use grayscale AA; the Platinum title test path
+		 * tries 1-bit-like mask rendering to approximate classic Mac glyphs. */
+		cairo_font_options_t *opts = cairo_font_options_create();
+		cairo_font_options_set_antialias(opts,
+			os9_platinum_charcoal_title(font) ? CAIRO_ANTIALIAS_GRAY : CAIRO_ANTIALIAS_GRAY);
+		if (os9_platinum_charcoal_title(font)) {
+			cairo_font_options_set_hint_style(opts, CAIRO_HINT_STYLE_MEDIUM);
+		}
+		PangoContext *ctx = pango_layout_get_context(layout);
+		pango_cairo_context_set_font_options(ctx, opts);
+		cairo_font_options_destroy(opts);
+	}
+
+	PangoFontDescription *desc = font_to_pango_desc(font);
+	pango_layout_set_font_description(layout, desc);
+	pango_font_description_free(desc);
+	pango_cairo_update_layout(cairo, layout);
+	pango_cairo_show_layout(cairo, layout);
+
+	g_object_unref(layout);
+
+	cairo_surface_flush(surf);
+	cairo_destroy(cairo);
+}
+
+void
+font_finish(void)
+{
+	pango_cairo_font_map_set_default(NULL);
+}

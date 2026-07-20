@@ -1,0 +1,12 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+/* WRDP modifications, 2026. */
+#ifndef WRDP_COMPOSITOR_THREE_STATE_H
+#define WRDP_COMPOSITOR_THREE_STATE_H
+
+enum three_state {
+	LAB_STATE_UNSPECIFIED = 0,
+	LAB_STATE_ENABLED,
+	LAB_STATE_DISABLED
+};
+
+#endif /* WRDP_COMPOSITOR_THREE_STATE_H */

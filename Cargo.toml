@@ -1,0 +1,332 @@
+[package]
+name = "wrdp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+authors = ["wrdp contributors"]
+description = "single-port Wayland RDP daemon with managed per-user sessions"
+license = "MIT"
+repository = "https://github.com/rcarmo/wrdp"
+keywords = ["rdp", "wayland", "remote-desktop", "linux", "screen-sharing"]
+categories = ["network-programming", "multimedia"]
+
+[[bin]]
+name = "wrdp"
+path = "src/bin/wrdp.rs"
+
+[[bin]]
+name = "wrdp-sesman"
+path = "src/bin/wrdp-sesman.rs"
+
+[[bin]]
+name = "wrdpctl"
+path = "src/bin/wrdpctl.rs"
+
+[lib]
+name = "wrdp"
+path = "src/lib.rs"
+
+# =============================================================================
+# Dependencies
+# =============================================================================
+
+[dependencies]
+# -----------------------------------------------------------------------------
+# Wayland/RDP support crates
+# -----------------------------------------------------------------------------
+# NOTE: IronRDP stays pinned to the wrdp branch while upstream server-side
+# changes are upstreamed and released on crates.io.
+
+# -----------------------------------------------------------------------------
+# Async runtime
+# -----------------------------------------------------------------------------
+tokio = { version = "1.52", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# -----------------------------------------------------------------------------
+# Configuration and CLI
+# -----------------------------------------------------------------------------
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+clap = { version = "4.6", features = ["derive", "env"] }
+
+# -----------------------------------------------------------------------------
+# Logging and tracing
+# -----------------------------------------------------------------------------
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+
+# -----------------------------------------------------------------------------
+# Error handling
+# -----------------------------------------------------------------------------
+anyhow = "1.0"
+thiserror = "2"
+
+# -----------------------------------------------------------------------------
+# Networking and protocols
+# -----------------------------------------------------------------------------
+bytes = "1.12"
+rustls-pemfile = "2.2"
+x509-cert = "0.2.5"
+
+# -----------------------------------------------------------------------------
+# RDP protocol (IronRDP)
+# Git deps required: ironrdp-egfx is not published to crates.io yet
+# (publish = false in upstream Cargo.toml).
+#
+# Consume the canonical stack branch from rcarmo/IronRDP while the required
+# server-side hooks are prepared as separate upstreamable changes.
+ironrdp-server = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e", features = ["egfx", "helper"] }
+ironrdp-pdu = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
+ironrdp-displaycontrol = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
+ironrdp-cliprdr = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
+ironrdp-core = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
+ironrdp-egfx = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
+ironrdp-svc = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
+ironrdp-dvc = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
+ironrdp-graphics = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
+
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Wayland and Portal integration
+# -----------------------------------------------------------------------------
+wayland-client = { version = "0.31" }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+gbm = { version = "0.18", default-features = false, features = ["drm-support"] }
+drm-fourcc = "2.2"
+ashpd = { version = "0.12.3", features = ["tokio"] }
+zbus = "5"
+enumflags2 = "0.7"
+
+# Standalone Wayland clipboard (ext-data-control / wlr-data-control protocol)
+# Composable with any runtime backend, not tied to portal-generic
+
+# Embedded portal backend for wlroots compositors (screencopy + input + clipboard)
+# Provides video capture, input injection, and clipboard via native Wayland protocols
+# without requiring xdg-desktop-portal-wlr or any external portal daemon
+
+# EIS protocol bridge used by the managed compositor input backend
+# Pure Rust implementation used by the portal-generic service
+reis = { version = "0.6", features = ["tokio"] }
+
+# -----------------------------------------------------------------------------
+# PipeWire integration (in-tree under src/desktop/pipewire)
+# -----------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Input handling
+# -----------------------------------------------------------------------------
+xkbcommon = "0.9"
+
+# -----------------------------------------------------------------------------
+# Image processing
+# -----------------------------------------------------------------------------
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+percent-encoding = "2.3"
+sha2 = "0.10"
+
+# -----------------------------------------------------------------------------
+# H.264 encoding (optional, for EGFX)
+# -----------------------------------------------------------------------------
+# Dynamic loading of Cisco's precompiled OpenH264 binary (patent-covered).
+# NEVER use features = ["source"] in shipped builds — zero patent coverage.
+openh264 = { version = "0.9.3", optional = true, default-features = false, features = ["libloading"] }
+libloading = { version = "0.8", optional = true }
+
+# -----------------------------------------------------------------------------
+# Hardware-accelerated encoding (optional)
+# -----------------------------------------------------------------------------
+# VA-API: Intel/AMD GPU encoding (ChromeOS bindings)
+# Requires libva-dev 1.20.0+ installed
+cros-libva = { version = "0.0.13", optional = true }
+
+# -----------------------------------------------------------------------------
+# System and utilities
+# -----------------------------------------------------------------------------
+nix = { version = "0.30", features = ["signal", "process", "mman", "fs", "user", "socket", "time"] }
+libc = "0.2"
+libspa = "0.9"
+libspa-sys = "0.9"
+pipewire = "0.9"
+png = "0.17"
+zvariant = "5.13"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
+dirs = "6.0"
+
+# -----------------------------------------------------------------------------
+# Cryptography (for session token encryption)
+# -----------------------------------------------------------------------------
+argon2 = "0.5"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# -----------------------------------------------------------------------------
+# Credential Storage Backends
+# -----------------------------------------------------------------------------
+# zeroize for secure memory handling of tokens
+zeroize = "1.9"
+
+# -----------------------------------------------------------------------------
+# Memory management
+# -----------------------------------------------------------------------------
+parking_lot = "0.12"
+
+# -----------------------------------------------------------------------------
+# Certificate generation
+# -----------------------------------------------------------------------------
+rcgen = { version = "0.14", features = ["zeroize", "x509-parser"] }
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+# -----------------------------------------------------------------------------
+# Authentication (optional)
+# -----------------------------------------------------------------------------
+nonstick = { version = "0.1", optional = true }
+listenfd = "1.0.2"
+configparser = "3.1.0"
+
+# =============================================================================
+# Dev Dependencies
+# =============================================================================
+
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+tempfile = "3.27"
+proptest = "1.11"
+
+# =============================================================================
+# Features
+# =============================================================================
+
+[features]
+default = ["pam-auth", "h264", "vaapi", "wayland", "portal-generic"]
+
+wayland = []
+portal-generic = []
+
+# Standalone Wayland data-control clipboard (ext-data-control / wlr-data-control)
+# Works with any runtime backend. Native-only (blocked by security-context-v1 in Flatpak).
+pam-auth = ["nonstick"]
+
+# H.264 software encoding via EGFX channel (dynamic loading)
+# Loads Cisco's precompiled OpenH264 binary at runtime for patent compliance.
+# The binary must be installed separately (e.g., libopenh264-7 on Debian).
+h264 = ["openh264", "libloading"]
+
+# Development/testing only: compile OpenH264 from source (NO patent coverage).
+# NEVER enable in any shipped binary.
+h264-source = ["openh264", "libloading", "openh264/source"]
+
+# Hardware-accelerated H.264 encoding (premium feature)
+# VA-API: Intel (iHD/i965) and AMD (radeonsi) GPU encoding
+# Requires libva-dev and GPU drivers
+vaapi = ["cros-libva"]
+
+# Convenience: enable all hardware backends
+hardware-encoding = ["vaapi"]
+
+
+# Reserved feature slot (not implemented yet)
+# multimon = []
+
+# =============================================================================
+# Profiles
+# =============================================================================
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+# Benchmark profile - optimized for accurate measurements
+[profile.bench]
+opt-level = 3
+debug = false
+lto = "thin"
+
+# =============================================================================
+# Lints
+# =============================================================================
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+elided_lifetimes_in_paths = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { priority = -1, level = "deny" }
+allow_attributes = "deny"
+
+# Selective allows for false-positive-prone or low-value pedantic lints
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+doc_markdown = "allow"
+similar_names = "allow"
+items_after_statements = "allow"
+redundant_else = "allow"
+match_same_arms = "allow"
+single_match_else = "allow"
+return_self_not_must_use = "allow"
+unused_self = "allow"
+unused_async = "allow"
+too_many_lines = "allow"
+manual_is_variant_and = "allow"
+bool_to_int_with_if = "allow"
+struct_excessive_bools = "allow"
+if_not_else = "allow"
+manual_let_else = "allow"
+missing_panics_doc = "allow"
+unnecessary_wraps = "allow"
+trivially_copy_pass_by_ref = "allow"
+needless_pass_by_value = "allow"
+manual_midpoint = "allow"
+match_wildcard_for_single_variants = "allow"
+ptr_as_ptr = "allow"
+cast_ptr_alignment = "allow"
+explicit_iter_loop = "allow"
+format_push_string = "allow"
+used_underscore_binding = "allow"
+used_underscore_items = "allow"
+struct_field_names = "allow"
+missing_fields_in_debug = "allow"
+unreadable_literal = "allow"
+
+# Functional lints
+wildcard_imports = "deny"
+large_futures = "warn"
+
+# Progressive (upgrade to "deny" when codebase is clean)
+unwrap_used = "warn"
+expect_used = "warn"
+
+# Coordinate/graphics code requires numeric casting
+as_conversions = "allow"
+cast_lossless = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+
+# =============================================================================
+# Patches - Override transitive dependencies
+# =============================================================================
+#
+# Placeholder patch section kept intentionally empty.
+# Add entries only when a transitive crate requires a temporary override.
+# =============================================================================
+
+[patch.crates-io]
+# IronRDP is consumed through direct git dependencies above. Do not add broad
+# redirects here unless a transitive dependency actually requires one.

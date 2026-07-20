@@ -1,0 +1,251 @@
+# WRDP development and validation targets.
+#
+# Common flow:
+#   make bootstrap          # install host packages + Rust toolchain
+#   make check              # Rust type-check
+#   make build              # debug build
+#   make compositor-build   # build vendored compositor
+
+SHELL := /usr/bin/env bash
+.SHELLFLAGS := -eu -o pipefail -c
+.DEFAULT_GOAL := help
+
+RUST_VERSION ?= 1.89.0
+FEATURES ?= default,vaapi
+WRDP_TMPDIR ?= $(CURDIR)/.local/tmp
+CARGO_TARGET_DIR ?= $(WRDP_TMPDIR)/wrdp-target
+COMPOSITOR_BUILD_DIR ?= $(WRDP_TMPDIR)/wrdp-compositor-build
+ASYNC_DIR ?= $(WRDP_TMPDIR)/async
+ASYNC_TARGET ?= check
+ASYNC_LOG ?= $(ASYNC_DIR)/$(ASYNC_TARGET).log
+ASYNC_PID ?= $(ASYNC_DIR)/$(ASYNC_TARGET).pid
+ASYNC_STATUS ?= $(ASYNC_DIR)/$(ASYNC_TARGET).status
+WRDP_COMPOSITOR_PREFIX ?= /usr
+WRDP_COMPOSITOR_BUILDTYPE ?= release
+WRDP_COMPOSITOR_DEFAULT_LIBRARY ?= static
+
+RUSTUP_HOME_DIR ?= $(or $(firstword $(wildcard $(HOME)/.rustup)),$(HOME)/.rustup)
+CARGO_HOME_DIR ?= $(or $(firstword $(wildcard $(HOME)/.cargo)),$(HOME)/.cargo)
+RUSTUP_BIN ?= $(CARGO_HOME_DIR)/bin/rustup
+RUSTUP_ENV := RUSTUP_HOME=$(RUSTUP_HOME_DIR) CARGO_HOME=$(CARGO_HOME_DIR)
+CARGO ?= $(RUSTUP_ENV) $(RUSTUP_BIN) run $(RUST_VERSION) cargo
+MESON ?= meson
+DOCKER ?= docker
+APT_GET ?= apt-get
+SUDO ?= $(shell if [ "$$(id -u)" = 0 ]; then printf ""; else printf "sudo"; fi)
+
+CARGO_ENV := TMPDIR=$(WRDP_TMPDIR) CARGO_TARGET_DIR=$(CARGO_TARGET_DIR)
+CARGO_COMMON := --features $(FEATURES)
+
+# Host packages needed for local Rust builds, compositor builds,
+# and day-to-day repository work on Debian.
+APT_PACKAGES := \
+	build-essential \
+	ca-certificates \
+	clang \
+	cmake \
+	curl \
+	debhelper \
+	devscripts \
+	dpkg-dev \
+	gettext \
+	git \
+	jq \
+	libcairo2-dev \
+	libdbus-1-dev \
+	libdrm-dev \
+	libfuse3-dev \
+	libgbm-dev \
+	libglib2.0-dev \
+	libinput-dev \
+	libpam0g-dev \
+	libpango1.0-dev \
+	libpipewire-0.3-dev \
+	libpixman-1-dev \
+	libpng-dev \
+	librsvg2-dev \
+	libsfdo-dev \
+	libspa-0.2-dev \
+	libssl-dev \
+	libva-dev \
+	libwayland-dev \
+	libwlroots-dev \
+	libxcb-icccm4-dev \
+	libxcb1-dev \
+	libxkbcommon-dev \
+	meson \
+	nasm \
+	ninja-build \
+	pkgconf \
+	ripgrep
+
+.PHONY: help
+help: ## Show this help.
+	@awk 'BEGIN {FS = ":.*##"; printf "\nwrdp development targets\n\n"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  %-22s %s\n", $$1, $$2} END {printf "\nVariables: RUST_VERSION=%s FEATURES=%s WRDP_TMPDIR=%s CARGO_TARGET_DIR=%s\n", "$(RUST_VERSION)", "$(FEATURES)", "$(WRDP_TMPDIR)", "$(CARGO_TARGET_DIR)"}' $(MAKEFILE_LIST)
+
+.PHONY: bootstrap
+bootstrap: deps rustup ## Install host dependencies and Rust toolchain.
+
+.PHONY: deps
+deps: ## Install Debian packages needed for development and packaging.
+	$(SUDO) $(APT_GET) update
+	$(SUDO) $(APT_GET) install -y $(APT_PACKAGES)
+
+.PHONY: rustup-install
+rustup-install: ## Install rustup if it is not already available.
+	@if [ -x '$(RUSTUP_BIN)' ]; then \
+		echo "rustup already installed: $$($(RUSTUP_ENV) $(RUSTUP_BIN) --version)"; \
+	else \
+		RUSTUP_HOME='$(RUSTUP_HOME_DIR)' CARGO_HOME='$(CARGO_HOME_DIR)' curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | RUSTUP_HOME='$(RUSTUP_HOME_DIR)' CARGO_HOME='$(CARGO_HOME_DIR)' sh -s -- -y --profile minimal --default-toolchain none; \
+		echo 'Restart the shell or source $$HOME/.cargo/env before using rustup from PATH.'; \
+	fi
+
+.PHONY: rustup
+rustup: rustup-install ## Install/update the pinned Rust toolchain and standard components.
+	$(RUSTUP_ENV) $(RUSTUP_BIN) toolchain install $(RUST_VERSION) --profile minimal --component rustfmt --component clippy
+	$(RUSTUP_ENV) $(RUSTUP_BIN) default $(RUST_VERSION)
+
+.PHONY: toolchain-check
+toolchain-check: ## Print the active pinned Rust toolchain versions.
+	$(RUSTUP_ENV) $(RUSTUP_BIN) run $(RUST_VERSION) rustc --version
+	$(CARGO) --version
+	$(RUSTUP_ENV) $(RUSTUP_BIN) run $(RUST_VERSION) rustfmt --version || true
+	$(RUSTUP_ENV) $(RUSTUP_BIN) run $(RUST_VERSION) cargo clippy --version || true
+
+.PHONY: metadata
+metadata: ## Validate Cargo metadata and print package name/version/license.
+	$(CARGO_ENV) $(CARGO) metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.name=="wrdp") | [.name,.version,.license] | @tsv'
+
+.PHONY: fetch
+fetch: ## Fetch Rust dependencies for the pinned toolchain.
+	$(CARGO_ENV) $(CARGO) fetch
+
+.PHONY: fmt
+fmt: ## Check Rust formatting.
+	$(CARGO_ENV) $(CARGO) fmt --all -- --check
+
+.PHONY: fmt-fix
+fmt-fix: ## Apply Rust formatting.
+	$(CARGO_ENV) $(CARGO) fmt --all
+
+.PHONY: check
+check: ## Type-check library and binaries.
+	$(CARGO_ENV) $(CARGO) check --lib --bins $(CARGO_COMMON)
+
+.PHONY: clippy
+clippy: ## Run clippy with the selected feature set.
+	$(CARGO_ENV) $(CARGO) clippy --lib --bins $(CARGO_COMMON)
+
+.PHONY: test
+test: ## Run Rust unit tests.
+	$(CARGO_ENV) $(CARGO) test --lib --bins $(CARGO_COMMON)
+
+.PHONY: build
+build: ## Build debug binaries.
+	$(CARGO_ENV) $(CARGO) build --bins $(CARGO_COMMON)
+
+.PHONY: build-release
+build-release: ## Build optimized release binaries.
+	$(CARGO_ENV) $(CARGO) build --release --bins $(CARGO_COMMON)
+
+.PHONY: smoke-help
+smoke-help: ## Smoke-test the already-built wrdp binary CLI. Run async-build first.
+	test -x $(CARGO_TARGET_DIR)/debug/wrdp
+	$(CARGO_TARGET_DIR)/debug/wrdp --help >/dev/null
+
+.PHONY: smoke-systemd
+smoke-systemd: ## Smoke-test the installed systemd socket/service state without changing source.
+	systemctl is-active --quiet wrdp.socket
+	ss -ltn | grep -q ':3389 '
+	systemctl status wrdp.service --no-pager -l >/dev/null || true
+
+.PHONY: compositor-configure
+compositor-configure: ## Configure the vendored wrdp compositor build.
+	$(MESON) setup $(COMPOSITOR_BUILD_DIR) vendor/wrdp-compositor \
+		--prefix=$(WRDP_COMPOSITOR_PREFIX) \
+		--buildtype=$(WRDP_COMPOSITOR_BUILDTYPE) \
+		--default-library=$(WRDP_COMPOSITOR_DEFAULT_LIBRARY)
+
+.PHONY: compositor-build
+compositor-build: ## Build the vendored wrdp compositor.
+	@if [ ! -f '$(COMPOSITOR_BUILD_DIR)/build.ninja' ]; then \
+		$(MAKE) compositor-configure; \
+	fi
+	$(MESON) compile -C $(COMPOSITOR_BUILD_DIR)
+
+.PHONY: compositor-clean
+compositor-clean: ## Remove the vendored compositor build directory.
+	rm -rf $(COMPOSITOR_BUILD_DIR)
+
+.PHONY: validate-production
+validate-production: metadata fmt ## Run release-oriented Rust and compositor gates.
+	$(CARGO_ENV) $(CARGO) check --locked --lib --bins --all-features
+	$(CARGO_ENV) $(CARGO) test --locked --lib --bins --all-features
+	$(CARGO_ENV) $(CARGO) check --locked --lib --bins --no-default-features
+	$(CARGO_ENV) $(CARGO) test --locked --lib --bins --no-default-features
+	$(CARGO_ENV) $(CARGO) build --locked --release --bins $(CARGO_COMMON)
+	$(MAKE) compositor-build
+
+.PHONY: lifecycle
+lifecycle: metadata check build compositor-build ## Run the standard local development lifecycle.
+
+.PHONY: ci
+ci: metadata fmt check test build compositor-build ## Run CI-style checks.
+
+.PHONY: async-start
+async-start: ## Start ASYNC_TARGET in the background; writes log/pid/status under ASYNC_DIR.
+	@mkdir -p '$(ASYNC_DIR)' '$(WRDP_TMPDIR)'
+	@if [ -f '$(ASYNC_PID)' ] && kill -0 "$$(cat '$(ASYNC_PID)')" 2>/dev/null; then \
+		echo "$(ASYNC_TARGET) already running: pid $$(cat '$(ASYNC_PID)')"; \
+		exit 0; \
+	fi
+	@printf 'running\n' > '$(ASYNC_STATUS)'
+	@nohup bash -lc 'cd "$(CURDIR)" && export HOME="$(HOME)" PATH="$(CARGO_HOME_DIR)/bin:$$PATH" WRDP_TMPDIR="$(WRDP_TMPDIR)" CARGO_TARGET_DIR="$(CARGO_TARGET_DIR)" FEATURES="$(FEATURES)" RUST_VERSION="$(RUST_VERSION)"; echo "[$$(date -Is)] START make $(ASYNC_TARGET)"; ionice -c2 -n7 nice -n 15 $(MAKE) --no-print-directory $(ASYNC_TARGET); rc=$$?; echo "[$$(date -Is)] END make $(ASYNC_TARGET) status=$$rc"; echo $$rc > "$(ASYNC_STATUS)"; exit $$rc' > '$(ASYNC_LOG)' 2>&1 & echo $$! > '$(ASYNC_PID)'
+	@echo "started $(ASYNC_TARGET): pid $$(cat '$(ASYNC_PID)') log=$(ASYNC_LOG) status=$(ASYNC_STATUS)"
+
+.PHONY: async-check async-test async-build async-ci async-h264-check
+async-check: ## Start `make check` asynchronously.
+	@$(MAKE) --no-print-directory async-start ASYNC_TARGET=check
+async-test: ## Start `make test` asynchronously.
+	@$(MAKE) --no-print-directory async-start ASYNC_TARGET=test
+async-build: ## Start `make build` asynchronously.
+	@$(MAKE) --no-print-directory async-start ASYNC_TARGET=build
+async-ci: ## Start `make ci` asynchronously.
+	@$(MAKE) --no-print-directory async-start ASYNC_TARGET=ci
+async-h264-check: ## Start a viable H.264-only check asynchronously.
+	@$(MAKE) --no-print-directory async-start ASYNC_TARGET=check FEATURES='h264 wayland portal-generic'
+
+.PHONY: async-status
+async-status: ## Show async job status and the tail of its log.
+	@mkdir -p '$(ASYNC_DIR)'
+	@if [ -f '$(ASYNC_PID)' ] && kill -0 "$$(cat '$(ASYNC_PID)')" 2>/dev/null; then \
+		echo "$(ASYNC_TARGET): running pid=$$(cat '$(ASYNC_PID)')"; \
+	else \
+		echo "$(ASYNC_TARGET): not running status=$$(cat '$(ASYNC_STATUS)' 2>/dev/null || echo unknown)"; \
+	fi
+	@if [ -f '$(ASYNC_LOG)' ]; then tail -n 80 '$(ASYNC_LOG)'; else echo "no log: $(ASYNC_LOG)"; fi
+
+.PHONY: async-log
+async-log: ## Tail the async job log for ASYNC_TARGET.
+	@tail -n 160 '$(ASYNC_LOG)' 2>/dev/null || echo "no log: $(ASYNC_LOG)"
+
+.PHONY: async-stop
+async-stop: ## Stop the async job for ASYNC_TARGET if it is still running.
+	@if [ -f '$(ASYNC_PID)' ] && kill -0 "$$(cat '$(ASYNC_PID)')" 2>/dev/null; then \
+		pid="$$(cat '$(ASYNC_PID)')"; kill "$$pid"; echo stopped "$$pid"; \
+	else \
+		echo "$(ASYNC_TARGET): no running pid"; \
+	fi
+
+.PHONY: clean
+clean: compositor-clean ## Remove local build artifacts.
+	$(CARGO_ENV) $(CARGO) clean
+	rm -rf $(CARGO_TARGET_DIR)
+
+.PHONY: async-clean
+async-clean: async-stop ## Remove async logs/status and temp build artifacts.
+	rm -rf $(ASYNC_DIR) $(CARGO_TARGET_DIR) $(COMPOSITOR_BUILD_DIR)
+
+.PHONY: distclean
+distclean: clean async-clean ## Remove generated build artifacts.
+	rm -rf out target

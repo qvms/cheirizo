@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [public/main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 1.89.0
+  WRDP_TMPDIR: ${{ github.workspace }}/.local/tmp
+  CARGO_TARGET_DIR: ${{ github.workspace }}/.local/tmp/wrdp-target
+  PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
+
+jobs:
+  rust:
+    name: Rust / default production features
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake jq libdbus-1-dev libdrm-dev libgbm-dev \
+            libpam0g-dev libpipewire-0.3-dev libspa-0.2-dev libssl-dev \
+            libva-dev libwayland-dev libxkbcommon-dev nasm pkgconf
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component rustfmt --component clippy
+          rustup default "$RUST_VERSION"
+
+      # v5 actions run on Node 24. Cache keys are lockfile-scoped and no build
+      # artifacts are uploaded, bounding retained Actions storage to Cargo cache.
+      - name: Restore bounded Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ env.CARGO_TARGET_DIR }}
+          key: cargo-${{ runner.os }}-${{ env.RUST_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ env.RUST_VERSION }}-
+
+      - name: Validate metadata and formatting
+        run: |
+          mkdir -p "$WRDP_TMPDIR"
+          cargo metadata --locked --format-version 1 --no-deps >/dev/null
+          cargo fmt --all -- --check
+
+      - name: Check all default-feature targets
+        run: cargo check --locked --all-targets
+
+      - name: Run library tests
+        run: cargo test --locked --lib -- --test-threads=1
+
+      - name: Build production binaries
+        run: cargo build --locked --bins
+
+  compositor:
+    name: Bundled compositor
+    runs-on: ubuntu-24.04
+    container: debian:trixie-slim
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Install compositor build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git build-essential meson ninja-build pkgconf libcairo2-dev \
+            libdrm-dev libgbm-dev libinput-dev libpam0g-dev libpango1.0-dev \
+            libpixman-1-dev libpng-dev librsvg2-dev libwayland-dev \
+            libwlroots-0.18-dev libxcb-icccm4-dev libxcb1-dev libxkbcommon-dev
+
+      - name: Build bundled compositor
+        run: |
+          meson setup .local/compositor-build vendor/wrdp-compositor \
+            --prefix=/usr --buildtype=release --default-library=static
+          meson compile -C .local/compositor-build
