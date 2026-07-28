@@ -111,9 +111,54 @@ static LOGGED_FIRST_BITMAP_UPDATE: AtomicBool = AtomicBool::new(false);
 /// Sent from `request_layout()` (sync context) to the pipeline loop (async)
 /// via a bounded sync channel. The pipeline coalesces multiple requests
 /// and executes the resize sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResizeRequest {
     width: u16,
     height: u16,
+}
+
+#[derive(Debug)]
+struct ResizeCoordinator {
+    applied: ResizeRequest,
+    queued: std::collections::VecDeque<ResizeRequest>,
+    next_allowed: Option<std::time::Instant>,
+}
+
+impl ResizeCoordinator {
+    const CAPACITY: usize = 8;
+    const REACTIVATION_GUARD: std::time::Duration = std::time::Duration::from_secs(2);
+
+    fn new(width: u16, height: u16) -> Self {
+        Self {
+            applied: ResizeRequest { width, height },
+            queued: std::collections::VecDeque::new(),
+            next_allowed: None,
+        }
+    }
+
+    fn request(&mut self, request: ResizeRequest) {
+        if self.queued.back().copied() == Some(request)
+            || (self.queued.is_empty() && self.applied == request)
+        {
+            return;
+        }
+        if self.queued.len() == Self::CAPACITY {
+            self.queued.pop_front();
+        }
+        self.queued.push_back(request);
+    }
+
+    fn take_ready(&mut self, now: std::time::Instant) -> Option<ResizeRequest> {
+        self.next_allowed
+            .is_none_or(|deadline| now >= deadline)
+            .then(|| self.queued.pop_front())
+            .flatten()
+    }
+
+    fn mark_applied(&mut self, request: ResizeRequest, now: std::time::Instant) {
+        self.applied = request;
+        self.next_allowed = Some(now + Self::REACTIVATION_GUARD);
+    }
 }
 
 /// Video encoder abstraction for codec-agnostic frame encoding
@@ -380,9 +425,8 @@ pub struct DisplayChannelHandler {
         >,
     >,
 
-    /// Latest client resize request. New requests replace the slot so resize
-    /// bursts cannot leave the pipeline applying a stale intermediate size.
-    pending_resize: Arc<std::sync::Mutex<Option<ResizeRequest>>>,
+    /// Ordered, bounded resize requests serialized across core reactivation.
+    resize: Arc<std::sync::Mutex<ResizeCoordinator>>,
 
     /// Whether a client is actively connected and consuming frames.
     /// Set true on new connection (in `updates()`), false on disconnect.
@@ -390,6 +434,14 @@ pub struct DisplayChannelHandler {
     client_active: Arc<std::sync::atomic::AtomicBool>,
     /// Health reporter for forwarding PipeWire stream state to health monitor
     health_reporter: Arc<RwLock<Option<crate::rdp::session::supervision::SessionStatusReporter>>>,
+}
+
+fn replace_desktop_size(size: &mut DesktopSize, width: u16, height: u16) -> bool {
+    if (size.width, size.height) == (width, height) {
+        return false;
+    }
+    *size = DesktopSize { width, height };
+    true
 }
 
 impl DisplayChannelHandler {
@@ -699,7 +751,10 @@ impl DisplayChannelHandler {
             egfx_needs_init: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             input_handler: Arc::new(RwLock::new(None)),
             clipboard_manager: Arc::new(RwLock::new(None)),
-            pending_resize: Arc::new(std::sync::Mutex::new(None)),
+            resize: Arc::new(std::sync::Mutex::new(ResizeCoordinator::new(
+                initial_width,
+                initial_height,
+            ))),
             client_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             health_reporter: Arc::new(RwLock::new(None)),
         })
@@ -868,11 +923,15 @@ impl DisplayChannelHandler {
     /// Update the desktop size
     ///
     /// Called when monitor configuration changes or client requests resize.
-    pub async fn update_size(&self, width: u16, height: u16) {
-        let mut size = self.size.write().await;
-        size.width = width;
-        size.height = height;
-        debug!("Updated display size to {}x{}", width, height);
+    pub async fn update_size(&self, width: u16, height: u16) -> bool {
+        {
+            let mut size = self.size.write().await;
+            if !replace_desktop_size(&mut size, width, height) {
+                debug!(width, height, "Suppressing identical desktop resize");
+                return false;
+            }
+        }
+        info!(width, height, "Publishing desktop resize");
 
         let update = DisplayUpdate::Resize(DesktopSize { width, height });
         // Reconnection swaps this shared sender. Do not retain the mutex while
@@ -880,7 +939,9 @@ impl DisplayChannelHandler {
         let sender = self.update_sender.lock().await.clone();
         if let Err(e) = sender.send(update).await {
             warn!("Failed to send resize update: {}", e);
+            return false;
         }
+        true
     }
 
     /// Get a shared reference to the update sender for graphics drain task
@@ -1147,13 +1208,14 @@ impl DisplayChannelHandler {
                 }
 
                 // === CLIENT-INITIATED RESIZE ===
-                // Atomically take the latest request. Bursty edge dragging
-                // replaces this slot and therefore converges on the final size.
+                // Serialize core resize updates: each update causes an RDP
+                // Deactivate-Reactivate cycle in IronRDP. Distinct later requests
+                // remain queued while the client completes that transition.
                 let latest_resize = handler
-                    .pending_resize
+                    .resize
                     .lock()
                     .ok()
-                    .and_then(|mut pending| pending.take());
+                    .and_then(|mut resize| resize.take_ready(std::time::Instant::now()));
                 if let Some(req) = latest_resize {
                     info!(
                         "Direct-channel resize requested: {}x{}; updating compositor, RDP desktop, and EGFX surfaces",
@@ -1168,7 +1230,10 @@ impl DisplayChannelHandler {
                             "Failed to resize managed compositor output; using frame crop fallback: {e}"
                         );
                     }
-                    handler.update_size(req.width, req.height).await;
+                    let _published = handler.update_size(req.width, req.height).await;
+                    if let Ok(mut resize) = handler.resize.lock() {
+                        resize.mark_applied(req, std::time::Instant::now());
+                    }
                     {
                         let mut converter = handler.bitmap_converter.lock().await;
                         *converter = BitmapConverter::new(req.width, req.height);
@@ -1284,7 +1349,7 @@ impl DisplayChannelHandler {
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            handler.update_size(target_w, target_h).await;
+                            let _published = handler.update_size(target_w, target_h).await;
 
                             let input_handler = handler.input_handler.read().await.clone();
                             if let Some(input_handler) = input_handler
@@ -2711,17 +2776,15 @@ impl RdpServerDisplay for DisplayChannelHandler {
             new_w, new_h, raw_w, raw_h
         );
 
-        // Replace rather than enqueue: the pipeline only needs the final size
-        // from a burst of display-control PDUs.
-        match self.pending_resize.lock() {
-            Ok(mut pending) => {
-                *pending = Some(ResizeRequest {
+        match self.resize.lock() {
+            Ok(mut resize) => {
+                resize.request(ResizeRequest {
                     width: new_w,
                     height: new_h,
                 });
-                debug!("Latest resize request stored for pipeline");
+                debug!(queued = resize.queued.len(), "Resize request queued");
             }
-            Err(error) => error!("Resize request lock poisoned: {error}"),
+            Err(error) => error!("Resize coordinator lock poisoned: {error}"),
         }
     }
 }
@@ -2750,7 +2813,7 @@ impl Clone for DisplayChannelHandler {
             egfx_needs_init: Arc::clone(&self.egfx_needs_init), // Share EGFX init state
             input_handler: Arc::clone(&self.input_handler), // Share input handler ref
             clipboard_manager: Arc::clone(&self.clipboard_manager), // Share clipboard manager ref
-            pending_resize: Arc::clone(&self.pending_resize),
+            resize: Arc::clone(&self.resize),
             client_active: Arc::clone(&self.client_active),
             health_reporter: Arc::clone(&self.health_reporter),
         }
@@ -2788,6 +2851,116 @@ impl RdpServerDisplayUpdates for DisplayUpdatesStream {
 mod tests {
     use super::*;
     use crate::rdp::channels::graphics::bitmap::converter::{BitmapData, Rectangle};
+
+    #[test]
+    fn identical_desktop_size_is_not_published_twice() {
+        let mut size = DesktopSize {
+            width: 1280,
+            height: 720,
+        };
+        assert!(replace_desktop_size(&mut size, 864, 634));
+        assert_eq!((size.width, size.height), (864, 634));
+        assert!(!replace_desktop_size(&mut size, 864, 634));
+    }
+
+    #[test]
+    fn resize_coordinator_preserves_distinct_requests_across_guard() {
+        let start = std::time::Instant::now();
+        let mut resize = ResizeCoordinator::new(1280, 720);
+        for (width, height) in [(864, 634), (1376, 960), (1280, 720), (1920, 1080)] {
+            resize.request(ResizeRequest { width, height });
+        }
+
+        let first = resize.take_ready(start).unwrap();
+        assert_eq!(
+            first,
+            ResizeRequest {
+                width: 864,
+                height: 634
+            }
+        );
+        resize.mark_applied(first, start);
+        assert!(
+            resize
+                .take_ready(start + std::time::Duration::from_secs(1))
+                .is_none()
+        );
+
+        let mut applied = vec![first];
+        for seconds in [2, 4, 6] {
+            let now = start + std::time::Duration::from_secs(seconds);
+            let request = resize.take_ready(now).unwrap();
+            resize.mark_applied(request, now);
+            applied.push(request);
+        }
+        assert_eq!(
+            applied,
+            vec![
+                ResizeRequest {
+                    width: 864,
+                    height: 634
+                },
+                ResizeRequest {
+                    width: 1376,
+                    height: 960
+                },
+                ResizeRequest {
+                    width: 1280,
+                    height: 720
+                },
+                ResizeRequest {
+                    width: 1920,
+                    height: 1080
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resize_coordinator_coalesces_only_consecutive_duplicates() {
+        let mut resize = ResizeCoordinator::new(1280, 720);
+        resize.request(ResizeRequest {
+            width: 1280,
+            height: 720,
+        });
+        resize.request(ResizeRequest {
+            width: 864,
+            height: 634,
+        });
+        resize.request(ResizeRequest {
+            width: 864,
+            height: 634,
+        });
+        resize.request(ResizeRequest {
+            width: 1280,
+            height: 720,
+        });
+        assert_eq!(resize.queued.len(), 2);
+        assert_eq!(
+            resize.queued[0],
+            ResizeRequest {
+                width: 864,
+                height: 634
+            }
+        );
+        assert_eq!(
+            resize.queued[1],
+            ResizeRequest {
+                width: 1280,
+                height: 720
+            }
+        );
+    }
+
+    #[test]
+    fn resize_coordinator_is_bounded_under_drag_bursts() {
+        let mut resize = ResizeCoordinator::new(1280, 720);
+        for width in 800..900 {
+            resize.request(ResizeRequest { width, height: 600 });
+        }
+        assert_eq!(resize.queued.len(), ResizeCoordinator::CAPACITY);
+        assert_eq!(resize.queued.back().unwrap().width, 899);
+    }
 
     #[tokio::test]
     async fn test_pixel_format_conversion() {
