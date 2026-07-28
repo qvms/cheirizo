@@ -225,6 +225,7 @@ impl PortalSessionBackend {
             rollback.disarm();
             Ok(PortalGenericSessionHandle {
                 session_id,
+                first_pointer_event: std::sync::atomic::AtomicBool::new(false),
                 input_backend: Arc::new(Mutex::new(input_backend)),
                 _capture_backend: Arc::new(Mutex::new(capture_backend)),
                 clipboard_backend,
@@ -248,6 +249,7 @@ impl PortalSessionBackend {
 /// consumed by the RDP server session layer.
 struct PortalGenericSessionHandle {
     session_id: String,
+    first_pointer_event: std::sync::atomic::AtomicBool,
     input_backend: Arc<Mutex<Box<dyn InputBackend>>>,
     _capture_backend: Arc<Mutex<Box<dyn crate::desktop::portal::xdg_desktop::CaptureBackend>>>,
     clipboard_backend:
@@ -438,6 +440,17 @@ impl SessionHandle for PortalGenericSessionHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (x, y) = normalize_absolute_pointer_position(&streams, stream_id, x, y);
+        if !self
+            .first_pointer_event
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            info!(
+                stream_id,
+                normalized_x = x,
+                normalized_y = y,
+                "First normalized pointer event"
+            );
+        }
 
         let event = InputEvent::Pointer(PointerEvent::MotionAbsolute {
             x,
