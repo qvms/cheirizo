@@ -124,6 +124,9 @@ struct ResizeCoordinator {
 
 impl ResizeCoordinator {
     const CAPACITY: usize = 8;
+    // IronRDP exposes no completion callback for Deactivate-Reactivate.
+    // Serialize updates conservatively so a second resize is not injected into
+    // capability exchange. This favors correctness over smooth drag-resizing.
     const REACTIVATION_GUARD: std::time::Duration = std::time::Duration::from_secs(2);
 
     fn new(width: u16, height: u16) -> Self {

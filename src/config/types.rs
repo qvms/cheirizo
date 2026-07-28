@@ -571,10 +571,13 @@ pub struct EgfxConfig {
     #[serde(default = "default_periodic_idr_interval")]
     pub periodic_idr_interval: u32,
 
-    /// Video codec preference: "auto", "avc420", "avc444"
-    /// - "auto": Use best available codec (AVC444 if client supports V10+, else AVC420)
-    /// - "avc420": Always use AVC420 (4:2:0 chroma), even if AVC444 is available
-    /// - "avc444": Prefer AVC444 (4:4:4 chroma) for superior text/UI rendering
+    /// Video codec preference: "auto", "avc420", "avc444", "bitmap".
+    /// Preferences are intersected with the client's wire capabilities; an
+    /// unavailable requested AVC mode safely downgrades to core bitmap updates.
+    /// - "auto": Prefer AVC444, then AVC420, then bitmap
+    /// - "avc420": Prefer AVC420; do not substitute AVC444
+    /// - "avc444": Prefer AVC444; do not substitute AVC420
+    /// - "bitmap": Disable RDPGFX and use core bitmap updates immediately
     pub codec: String,
 
     /// Quality parameter range
