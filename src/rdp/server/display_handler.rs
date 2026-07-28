@@ -2775,15 +2775,6 @@ impl RdpServerDisplay for DisplayChannelHandler {
             return;
         };
 
-        // Skip if same as current size
-        if let Ok(current) = self.size.try_read()
-            && current.width == new_w
-            && current.height == new_h
-        {
-            debug!("Requested resolution matches current, ignoring");
-            return;
-        }
-
         info!(
             "Resize request accepted: {}x{} (raw: {}x{})",
             new_w, new_h, raw_w, raw_h
@@ -2941,6 +2932,31 @@ mod tests {
                     height: 1080
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn return_to_applied_size_is_retained_behind_pending_requests() {
+        let mut resize = ResizeCoordinator::new(1280, 720);
+        resize.request(ResizeRequest {
+            width: 864,
+            height: 634,
+        });
+        resize.request(ResizeRequest {
+            width: 1376,
+            height: 960,
+        });
+        resize.request(ResizeRequest {
+            width: 1280,
+            height: 720,
+        });
+        assert_eq!(resize.queued.len(), 3);
+        assert_eq!(
+            resize.queued.back().copied(),
+            Some(ResizeRequest {
+                width: 1280,
+                height: 720
+            })
         );
     }
 
