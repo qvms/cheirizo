@@ -43,6 +43,17 @@ use crate::{
     rdp::server::{DisplayChannelHandler, EgfxChannelFactory, InputChannelHandler},
 };
 
+fn effective_codec_policy(
+    configured: crate::rdp::server::EgfxCodecPolicy,
+    hardware_enabled: bool,
+) -> crate::rdp::server::EgfxCodecPolicy {
+    if configured == crate::rdp::server::EgfxCodecPolicy::Auto && hardware_enabled {
+        crate::rdp::server::EgfxCodecPolicy::Avc420
+    } else {
+        configured
+    }
+}
+
 pub async fn run(config: Config) -> Result<()> {
     info!("starting wrdp production single-daemon listener");
 
@@ -69,8 +80,14 @@ pub async fn run(config: Config) -> Result<()> {
     let active_bound_user = Arc::new(Mutex::new(None));
     let active_display = Arc::new(Mutex::new(None));
 
-    let codec_policy = crate::rdp::server::EgfxCodecPolicy::parse(&config.egfx.codec)
+    let configured_codec_policy = crate::rdp::server::EgfxCodecPolicy::parse(&config.egfx.codec)
         .context("invalid egfx.codec")?;
+    // The VA-API implementation produces AVC420. Selecting AVC444 under
+    // `auto` would negotiate an incompatible sender and then require a software
+    // OpenH264 module that may not be installed. Keep auto aligned with the
+    // enabled hardware encoder; operators can still explicitly request AVC444.
+    let codec_policy =
+        effective_codec_policy(configured_codec_policy, config.hardware_encoding.enabled);
     let (gfx_factory, gfx_server_handle, gfx_handler_state) =
         if config.egfx.enabled && codec_policy != crate::rdp::server::EgfxCodecPolicy::Bitmap {
             let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str() {
@@ -657,5 +674,27 @@ impl RdpServerDisplayUpdates for ProductionNoopUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
         std::future::pending::<()>().await;
         unreachable!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rdp::server::EgfxCodecPolicy;
+
+    #[test]
+    fn hardware_auto_policy_uses_avc420() {
+        assert_eq!(
+            effective_codec_policy(EgfxCodecPolicy::Auto, true),
+            EgfxCodecPolicy::Avc420
+        );
+        assert_eq!(
+            effective_codec_policy(EgfxCodecPolicy::Auto, false),
+            EgfxCodecPolicy::Auto
+        );
+        assert_eq!(
+            effective_codec_policy(EgfxCodecPolicy::Avc444, true),
+            EgfxCodecPolicy::Avc444
+        );
     }
 }

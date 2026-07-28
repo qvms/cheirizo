@@ -713,10 +713,15 @@ impl ScreencopyState {
                     format_raw,
                 };
                 if tx.send(frame).is_err() {
-                    tracing::warn!(node_id, "Direct frame channel closed");
-                } else {
-                    tracing::trace!(node_id, width, height, "Sent frame via direct channel");
+                    tracing::info!(
+                        node_id,
+                        "Direct frame consumer closed; stopping screencopy capture"
+                    );
+                    self.frame_tx = None;
+                    self.stop_capture(node_id);
+                    return;
                 }
+                tracing::trace!(node_id, width, height, "Sent frame via direct channel");
             } else if let Some(pw) = &self.pipewire {
                 // PipeWire path — for non-local consumers
                 pw.queue_buffer(node_id, data, width, height, stride, format_raw);

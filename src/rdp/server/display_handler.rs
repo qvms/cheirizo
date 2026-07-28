@@ -437,6 +437,19 @@ pub struct DisplayChannelHandler {
     health_reporter: Arc<RwLock<Option<crate::rdp::session::supervision::SessionStatusReporter>>>,
 }
 
+fn enqueue_bitmap_update(
+    sender: &mpsc::Sender<DisplayUpdate>,
+    update: DisplayUpdate,
+) -> Result<bool> {
+    match sender.try_send(update) {
+        Ok(()) => Ok(true),
+        Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            anyhow::bail!("display update channel closed")
+        }
+    }
+}
+
 fn starts_in_bitmap_mode(config: &crate::config::Config) -> bool {
     !config.egfx.enabled || config.egfx.codec == "bitmap"
 }
@@ -2546,9 +2559,16 @@ impl DisplayChannelHandler {
                     for iron_bitmap in iron_updates {
                         let update = DisplayUpdate::Bitmap(iron_bitmap);
 
-                        if let Err(e) = sender.send(update).await {
-                            error!("Failed to send display update: {}", e);
-                            return;
+                        match enqueue_bitmap_update(&sender, update) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                frames_dropped = frames_dropped.saturating_add(1);
+                                trace!("Bitmap update queue full; dropping stale frame");
+                            }
+                            Err(e) => {
+                                error!("Failed to send display update: {e}");
+                                return;
+                            }
                         }
                     }
                 }
@@ -2863,6 +2883,21 @@ impl RdpServerDisplayUpdates for DisplayUpdatesStream {
 mod tests {
     use super::*;
     use crate::rdp::channels::graphics::bitmap::converter::{BitmapData, Rectangle};
+
+    #[tokio::test]
+    async fn bitmap_backpressure_drops_frames_without_blocking_control() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let bitmap = || {
+            DisplayUpdate::Resize(DesktopSize {
+                width: 800,
+                height: 600,
+            })
+        };
+        assert_eq!(enqueue_bitmap_update(&sender, bitmap()).unwrap(), true);
+        assert_eq!(enqueue_bitmap_update(&sender, bitmap()).unwrap(), false);
+        assert!(receiver.recv().await.is_some());
+        assert_eq!(enqueue_bitmap_update(&sender, bitmap()).unwrap(), true);
+    }
 
     #[test]
     fn explicit_bitmap_policy_bypasses_egfx_without_timeout() {
