@@ -61,8 +61,8 @@ pub struct EgfxChannelFactory {
     /// Created lazily on first call to build_server_with_handle()
     server_handle: Arc<RwLock<Option<GfxServerHandle>>>,
 
-    /// Force AVC420-only mode due to platform quirks (e.g., RHEL 9)
-    force_avc420_only: bool,
+    /// Server codec policy intersected with client wire capabilities.
+    codec_policy: EgfxCodecPolicy,
 
     /// Maximum frames in flight before backpressure
     max_frames_in_flight: u32,
@@ -71,10 +71,31 @@ pub struct EgfxChannelFactory {
     compression_mode: CompressionMode,
 }
 
-/// Explicit result of EGFX capability negotiation for a connected client.
+/// Server policy intersected with the client's RDPGFX capability flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgfxCodecPolicy {
+    Auto,
+    Avc420,
+    Avc444,
+    Bitmap,
+}
+
+impl EgfxCodecPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "avc420" => Some(Self::Avc420),
+            "avc444" => Some(Self::Avc444),
+            "bitmap" => Some(Self::Bitmap),
+            _ => None,
+        }
+    }
+}
+
+/// Explicit output path selected for a connected client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NegotiatedEgfxMode {
-    Planar,
+    Bitmap,
     Avc420,
     Avc444,
 }
@@ -82,7 +103,7 @@ pub enum NegotiatedEgfxMode {
 impl NegotiatedEgfxMode {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Planar => "Planar",
+            Self::Bitmap => "FastPath bitmap",
             Self::Avc420 => "AVC420",
             Self::Avc444 => "AVC444",
         }
@@ -147,10 +168,19 @@ impl EgfxChannelFactory {
             height,
             handler_state: Arc::new(RwLock::new(None)),
             server_handle: Arc::new(RwLock::new(None)),
-            force_avc420_only,
+            codec_policy: if force_avc420_only {
+                EgfxCodecPolicy::Avc420
+            } else {
+                EgfxCodecPolicy::Auto
+            },
             max_frames_in_flight,
             compression_mode,
         }
+    }
+
+    pub fn with_codec_policy(mut self, policy: EgfxCodecPolicy) -> Self {
+        self.codec_policy = policy;
+        self
     }
 
     /// Get shared reference to handler state
@@ -202,8 +232,13 @@ fn retry_rwlock_write<T>(lock: &RwLock<T>, mut update: impl FnMut(&mut T)) -> bo
 
 impl GfxServerFactory for EgfxChannelFactory {
     fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
-        let handler =
-            WrdpGraphicsHandler::with_quirks(self.width, self.height, self.force_avc420_only);
+        let handler = WrdpGraphicsHandler::with_config(
+            self.width,
+            self.height,
+            Arc::new(RwLock::new(None)),
+            self.codec_policy,
+            self.max_frames_in_flight,
+        );
         Box::new(handler)
     }
 
@@ -226,7 +261,7 @@ impl GfxServerFactory for EgfxChannelFactory {
             self.width,
             self.height,
             Arc::clone(&self.handler_state),
-            self.force_avc420_only,
+            self.codec_policy,
             self.max_frames_in_flight,
         );
 

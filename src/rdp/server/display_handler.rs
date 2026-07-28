@@ -853,7 +853,9 @@ impl DisplayChannelHandler {
                     NegotiatedEgfxMode::Avc420 | NegotiatedEgfxMode::Avc444 => {
                         "EGFX ready, AVC/H.264 negotiated"
                     }
-                    NegotiatedEgfxMode::Planar => "EGFX ready, Planar negotiated",
+                    NegotiatedEgfxMode::Bitmap => {
+                        "EGFX unavailable by policy; using FastPath bitmap"
+                    }
                 };
             }
         } else {
@@ -1017,7 +1019,6 @@ impl DisplayChannelHandler {
             #[cfg(feature = "vaapi")]
             let mut hardware_encoding_runtime_disabled = false;
             // IronRDP Planar encoder for EGFX Planar path (used when AVC is disabled and RFX unsupported)
-            let mut planar_encoder: Option<ironrdp_graphics::rdp6::BitmapStreamEncoder> = None;
             // AVC444 vs AVC420 determined by VideoEncoder enum variant match, not a flag
 
             // Force first frame after initialization - bypasses damage detection
@@ -1181,7 +1182,6 @@ impl DisplayChannelHandler {
                     // window resizes instead of merely recording them.
                     video_encoder = None;
                     egfx_sender = None;
-                    planar_encoder = None;
                     force_first_frame = true;
                     handler
                         .egfx_needs_init
@@ -1281,7 +1281,6 @@ impl DisplayChannelHandler {
                             // Force EGFX ResetGraphics/CreateSurface on the new size.
                             video_encoder = None;
                             egfx_sender = None;
-                            planar_encoder = None;
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1365,7 +1364,6 @@ impl DisplayChannelHandler {
                             egfx_frames_sent = 0;
                             video_encoder = None;
                             egfx_sender = None;
-                            planar_encoder = None;
                             // Clear cached frame from the earlier session. The cached frame
                             // was captured for a different client (possibly different
                             // codec/size). Replaying it into the new EGFX surface
@@ -1454,7 +1452,6 @@ impl DisplayChannelHandler {
                             egfx_frames_sent = 0;
                             video_encoder = None;
                             egfx_sender = None;
-                            planar_encoder = None;
                             // Clear cached frame from the earlier session (same reason
                             // as the Some-arm: avoid replaying stale frames across
                             // different clients/codecs).
@@ -1651,11 +1648,16 @@ impl DisplayChannelHandler {
                     handler.negotiated_egfx_mode().await
                 };
                 let is_avc = negotiated_egfx_mode.is_some_and(NegotiatedEgfxMode::uses_avc);
-                // Clients that negotiate EGFX but disable/do not support AVC use
-                // the explicit Planar mode. FastPath bitmap remains only for
-                // clients where EGFX never becomes ready or is disabled.
-                let is_egfx_rfx = negotiated_egfx_mode == Some(NegotiatedEgfxMode::Planar);
-                if needs_init && !is_avc && !is_egfx_rfx {
+                let use_bitmap = negotiated_egfx_mode == Some(NegotiatedEgfxMode::Bitmap);
+                if use_bitmap {
+                    egfx_gate_bypassed = true;
+                    video_encoder = None;
+                    egfx_sender = None;
+                    handler
+                        .egfx_needs_init
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                if needs_init && !is_avc && !use_bitmap {
                     // Distinguish between:
                     // 1. V8 client (no EGFX channel at all) → clear flag now
                     // 2. EGFX negotiation still pending (e.g. Android V10 with AVC-disabled/Planar) → wait
@@ -1678,101 +1680,6 @@ impl DisplayChannelHandler {
                             .store(false, std::sync::atomic::Ordering::SeqCst);
                     } else {
                         debug!("V8 check: skipping egfx_needs_init clear (caps still pending)");
-                    }
-                }
-
-                // === EGFX Planar PATH (AVC disabled) ===
-                // When EGFX is ready but AVC is disabled, use Planar codec (0xa)
-                // via EGFX channel. This provides ~5:1 to 25:1 compression without H.264.
-                // Planar is supported by the MS Android RD Client; RemoteFX (0x3) is NOT.
-                if is_egfx_rfx && needs_init {
-                    egfx_sender = None;
-
-                    if let Some(ref mut detector) = damage_detector_opt {
-                        detector.invalidate();
-                        info!("🔄 Damage detector invalidated for Planar reconnection");
-                    }
-
-                    info!(
-                        "🎬 EGFX channel ready - initializing Planar encoder (AVC disabled, codec_id=0xa)"
-                    );
-
-                    // Planar codec does NOT require 16-pixel alignment (only AVC/H.264 does).
-                    // Using actual dimensions prevents surface/bitmap height mismatch crashes.
-                    let surface_width = frame.width as u16;
-                    let surface_height = frame.height as u16;
-
-                    // Create IronRDP BitmapStreamEncoder (reference Planar implementation)
-                    planar_encoder = Some(ironrdp_graphics::rdp6::BitmapStreamEncoder::new(
-                        frame.width as usize,
-                        frame.height as usize,
-                    ));
-
-                    // Create EGFX surface with actual dimensions (no alignment)
-                    if let (Some(gfx_handle), Some(event_tx)) = (
-                        handler.gfx_server_handle.read().await.clone(),
-                        handler.server_event_tx.read().await.clone(),
-                    ) {
-                        {
-                            let mut server =
-                                gfx_handle.lock().expect("GfxServerHandle mutex poisoned");
-                            server.set_output_dimensions(surface_width, surface_height);
-
-                            // Reset the EGFX output before creating the Planar surface.
-                            crate::rdp::channels::graphics::egfx::channel::resize_with_primary_monitor(
-                                &mut server,
-                                surface_width,
-                                surface_height,
-                            );
-
-                            match server.create_surface(surface_width, surface_height) {
-                                Some(surface_id) => {
-                                    if let Ok(mut shared) = handler.gfx_handler_state.try_write()
-                                        && let Some(state) = shared.as_mut()
-                                    {
-                                        state.primary_surface_id = Some(surface_id);
-                                    }
-                                    info!(
-                                        "✅ EGFX Planar surface {} created: {}×{}",
-                                        surface_id, surface_width, surface_height
-                                    );
-
-                                    // Map surface to output (REQUIRED - client crashes without it)
-                                    if server.map_surface_to_output(surface_id, 0, 0) {
-                                        info!(
-                                            "✅ EGFX Planar surface {} mapped to output",
-                                            surface_id
-                                        );
-                                    }
-                                }
-                                None => {
-                                    warn!(
-                                        "Failed to create EGFX Planar surface - server may not be ready"
-                                    );
-                                }
-                            }
-                        }
-
-                        let sender = EgfxChannelSender::new(
-                            gfx_handle,
-                            handler.gfx_handler_state.clone(),
-                            event_tx,
-                        );
-                        match sender.flush_pending_server_messages().await {
-                            Ok(count) if count > 0 => {
-                                info!("✅ EGFX Planar surface messages sent to client");
-                            }
-                            Ok(_) => {}
-                            Err(e) => warn!("EGFX Planar: failed to flush surface messages: {e}"),
-                        }
-                        egfx_sender = Some(sender);
-                        info!("✅ EGFX Planar frame sender initialized");
-
-                        handler
-                            .egfx_needs_init
-                            .store(false, std::sync::atomic::Ordering::SeqCst);
-                        force_first_frame = true;
-                        info!("📺 First Planar frame after init will be forced");
                     }
                 }
 
@@ -2433,136 +2340,6 @@ impl DisplayChannelHandler {
                                 }
                                 frames_dropped += 1;
                                 continue; // Drop frame, don't fall through to RemoteFX
-                            }
-                        }
-                    }
-                }
-
-                // === EGFX Planar FRAME PATH (AVC disabled) ===
-                // Send frames via EGFX channel using Planar codec (0xa) when H.264 is unavailable
-                if let (Some(planar_enc), Some(sender)) = (&mut planar_encoder, &egfx_sender) {
-                    let timestamp_ms = if frame.pts > 0 {
-                        frame.pts / 1_000_000
-                    } else {
-                        let frame_interval_ms =
-                            1000 / u64::from(self.config.video.target_fps.max(1));
-                        frames_sent * frame_interval_ms
-                    };
-
-                    let expected_size = (frame.width * frame.height * 4) as usize;
-                    if frame.data.len() < expected_size {
-                        frames_dropped += 1;
-                        continue;
-                    }
-
-                    // Damage detection
-                    let force_full = force_first_frame;
-                    if force_first_frame {
-                        info!("📺 Forcing first Planar frame after init");
-                        force_first_frame = false;
-                    }
-
-                    let damage_regions = if force_full {
-                        vec![DamageRegion::full_frame(frame.width, frame.height)]
-                    } else if let Some(ref mut detector) = damage_detector_opt {
-                        detector.detect(&frame.data, frame.width, frame.height)
-                    } else {
-                        vec![DamageRegion::full_frame(frame.width, frame.height)]
-                    };
-
-                    let damage_ratio = if !damage_regions.is_empty() {
-                        let frame_area = (frame.width * frame.height) as u64;
-                        let damage_area: u64 = damage_regions.iter().map(DamageRegion::area).sum();
-                        damage_area as f32 / frame_area as f32
-                    } else {
-                        0.0
-                    };
-
-                    if adaptive_fps_enabled {
-                        adaptive_fps.update(damage_ratio);
-                    }
-
-                    if damage_regions.is_empty() {
-                        frames_skipped_damage += 1;
-                        continue;
-                    }
-
-                    // Build a *full-frame* IronRDP bitmap directly for EGFX Planar.
-                    // The frame has already been cropped to the client desktop and
-                    // is compact BGRx32. Do not route this through BitmapConverter:
-                    // for Android-sized compact BGRx frames it may hit the generic
-                    // BGRx -> BGRx conversion path, which is intentionally unsupported
-                    // and results in a blank screen because no Planar frames are sent.
-                    let bytes_per_pixel = frame.format.bytes_per_pixel() as usize;
-                    let expected_len =
-                        frame.width as usize * frame.height as usize * bytes_per_pixel;
-                    if frame.data.len() < expected_len {
-                        error!(
-                            "Planar: compact frame too small: len={} expected={} for {}×{}",
-                            frame.data.len(),
-                            expected_len,
-                            frame.width,
-                            frame.height
-                        );
-                        frames_dropped += 1;
-                        continue;
-                    }
-
-                    let planar_bitmap = IronBitmapUpdate {
-                        x: 0,
-                        y: 0,
-                        width: match NonZeroU16::new(frame.width as u16) {
-                            Some(width) => width,
-                            None => {
-                                frames_dropped += 1;
-                                continue;
-                            }
-                        },
-                        height: match NonZeroU16::new(frame.height as u16) {
-                            Some(height) => height,
-                            None => {
-                                frames_dropped += 1;
-                                continue;
-                            }
-                        },
-                        format: IronPixelFormat::BgrX32,
-                        data: Bytes::copy_from_slice(&frame.data[..expected_len]),
-                        stride: match NonZeroUsize::new(frame.width as usize * bytes_per_pixel) {
-                            Some(stride) => stride,
-                            None => {
-                                frames_dropped += 1;
-                                continue;
-                            }
-                        },
-                    };
-
-                    // Send via EGFX Planar (codec_id=0xa)
-                    {
-                        let send_result = sender
-                            .send_planar_frame(
-                                planar_enc,
-                                &planar_bitmap,
-                                planar_bitmap.width.get(),
-                                planar_bitmap.height.get(),
-                                timestamp_ms as u32,
-                            )
-                            .await;
-
-                        match send_result {
-                            Ok(_frame_id) => {
-                                egfx_frames_sent += 1;
-                                if egfx_frames_sent.is_multiple_of(30) {
-                                    debug!(
-                                        "📹 EGFX Uncompressed (diag): Sent {} frames via EGFX",
-                                        egfx_frames_sent
-                                    );
-                                }
-                                continue;
-                            }
-                            Err(e) => {
-                                trace!("EGFX Uncompressed send failed: {} - dropping frame", e);
-                                frames_dropped += 1;
-                                continue;
                             }
                         }
                     }

@@ -7,7 +7,9 @@
 mod factory;
 mod sender;
 
-pub use factory::{EgfxChannelFactory, HandlerState, NegotiatedEgfxMode, SharedHandlerState};
+pub use factory::{
+    EgfxChannelFactory, EgfxCodecPolicy, HandlerState, NegotiatedEgfxMode, SharedHandlerState,
+};
 pub use sender::EgfxChannelSender;
 
 pub(crate) use sender::resize_with_primary_monitor;

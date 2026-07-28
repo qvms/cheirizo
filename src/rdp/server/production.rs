@@ -69,37 +69,41 @@ pub async fn run(config: Config) -> Result<()> {
     let active_bound_user = Arc::new(Mutex::new(None));
     let active_display = Arc::new(Mutex::new(None));
 
-    let (gfx_factory, gfx_server_handle, gfx_handler_state) = if config.egfx.enabled {
-        let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str() {
-            "auto" => ironrdp_graphics::zgfx::CompressionMode::Auto,
-            "always" => ironrdp_graphics::zgfx::CompressionMode::Always,
-            _ => ironrdp_graphics::zgfx::CompressionMode::Never,
+    let codec_policy = crate::rdp::server::EgfxCodecPolicy::parse(&config.egfx.codec)
+        .context("invalid egfx.codec")?;
+    let (gfx_factory, gfx_server_handle, gfx_handler_state) =
+        if config.egfx.enabled && codec_policy != crate::rdp::server::EgfxCodecPolicy::Bitmap {
+            let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str() {
+                "auto" => ironrdp_graphics::zgfx::CompressionMode::Auto,
+                "always" => ironrdp_graphics::zgfx::CompressionMode::Always,
+                _ => ironrdp_graphics::zgfx::CompressionMode::Never,
+            };
+            let gfx_width = std::env::var("WRDP_DEFAULT_WIDTH")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1920);
+            let gfx_height = std::env::var("WRDP_DEFAULT_HEIGHT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1080);
+            let gfx_factory = EgfxChannelFactory::with_config(
+                gfx_width,
+                gfx_height,
+                false,
+                config.egfx.max_frames_in_flight,
+                compression_mode,
+            )
+            .with_codec_policy(codec_policy);
+            let gfx_handler_state = gfx_factory.handler_state();
+            let gfx_server_handle = gfx_factory.server_handle();
+            (
+                Some(Box::new(gfx_factory) as Box<dyn ironrdp_server::GfxServerFactory>),
+                Some(gfx_server_handle),
+                Some(gfx_handler_state),
+            )
+        } else {
+            (None, None, None)
         };
-        let gfx_width = std::env::var("WRDP_DEFAULT_WIDTH")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1920);
-        let gfx_height = std::env::var("WRDP_DEFAULT_HEIGHT")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1080);
-        let gfx_factory = EgfxChannelFactory::with_config(
-            gfx_width,
-            gfx_height,
-            false,
-            config.egfx.max_frames_in_flight,
-            compression_mode,
-        );
-        let gfx_handler_state = gfx_factory.handler_state();
-        let gfx_server_handle = gfx_factory.server_handle();
-        (
-            Some(Box::new(gfx_factory) as Box<dyn ironrdp_server::GfxServerFactory>),
-            Some(gfx_server_handle),
-            Some(gfx_handler_state),
-        )
-    } else {
-        (None, None, None)
-    };
 
     let clipboard_manager = if config.clipboard.enabled {
         let all_allowed = config.clipboard.allowed_types.is_empty();

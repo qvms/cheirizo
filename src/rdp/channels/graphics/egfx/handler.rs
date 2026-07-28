@@ -1,7 +1,7 @@
 //! IronRDP EGFX negotiation callbacks.
 
 use crate::rdp::channels::graphics::egfx::channel::{
-    HandlerState, NegotiatedEgfxMode, SharedHandlerState,
+    EgfxCodecPolicy, HandlerState, NegotiatedEgfxMode, SharedHandlerState,
 };
 use ironrdp_egfx::{
     pdu::{
@@ -14,14 +14,18 @@ use std::sync::Arc;
 
 pub struct WrdpGraphicsHandler {
     state: SharedHandlerState,
-    avc420_only: bool,
+    policy: EgfxCodecPolicy,
     max_frames: u32,
 }
 impl WrdpGraphicsHandler {
     pub fn with_quirks(_width: u16, _height: u16, avc420_only: bool) -> Self {
         Self {
             state: Arc::new(tokio::sync::RwLock::new(None)),
-            avc420_only,
+            policy: if avc420_only {
+                EgfxCodecPolicy::Avc420
+            } else {
+                EgfxCodecPolicy::Auto
+            },
             max_frames: 3,
         }
     }
@@ -29,12 +33,12 @@ impl WrdpGraphicsHandler {
         _width: u16,
         _height: u16,
         state: SharedHandlerState,
-        avc420_only: bool,
+        policy: EgfxCodecPolicy,
         max_frames: u32,
     ) -> Self {
         Self {
             state,
-            avc420_only,
+            policy,
             max_frames,
         }
     }
@@ -54,32 +58,27 @@ impl GraphicsPipelineHandler for WrdpGraphicsHandler {
         tracing::debug!(sets = pdu.0.len(), "EGFX capabilities advertised");
     }
     fn on_ready(&mut self, cap: &CapabilitySet) {
-        let (avc420, mut avc444, android) = codec_mode(cap);
-        if self.avc420_only {
-            avc444 = false
-        }
-        let mode = if avc444 {
-            NegotiatedEgfxMode::Avc444
-        } else if avc420 {
-            NegotiatedEgfxMode::Avc420
-        } else {
-            NegotiatedEgfxMode::Planar
-        };
+        let support = codec_support(cap);
+        let mode = select_mode(self.policy, support);
+        let (avc420, avc444) = (
+            mode == NegotiatedEgfxMode::Avc420,
+            mode == NegotiatedEgfxMode::Avc444,
+        );
         self.publish(Some(HandlerState {
             is_ready: true,
             negotiated_mode: Some(mode),
             is_avc420_enabled: avc420,
             is_avc444_enabled: avc444,
-            needs_android_pointer_updates: android,
+            needs_android_pointer_updates: mode == NegotiatedEgfxMode::Bitmap,
             primary_surface_id: None,
             dvc_channel_id: 0,
         }));
     }
     fn on_capability_negotiation_failed(&mut self) {
-        self.publish(None)
+        self.publish(Some(bitmap_fallback_state()))
     }
     fn on_close(&mut self) {
-        self.publish(None)
+        self.publish(Some(bitmap_fallback_state()))
     }
     fn max_frames_in_flight(&self) -> u32 {
         self.max_frames
@@ -98,17 +97,26 @@ impl GraphicsPipelineHandler for WrdpGraphicsHandler {
         ]
     }
 }
-fn codec_mode(cap: &CapabilitySet) -> (bool, bool, bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodecSupport {
+    avc420: bool,
+    avc444: bool,
+}
+
+fn codec_support(cap: &CapabilitySet) -> CodecSupport {
     match cap {
-        CapabilitySet::V8 { .. } => (false, false, true),
+        CapabilitySet::V8 { .. } => disabled(),
         CapabilitySet::V8_1 { flags } => {
             let avc = flags.contains(CapabilitiesV81Flags::AVC420_ENABLED);
-            (avc, false, !avc)
+            CodecSupport {
+                avc420: avc,
+                avc444: false,
+            }
         }
         CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
             enabled(!flags.contains(CapabilitiesV10Flags::AVC_DISABLED))
         }
-        CapabilitySet::V10_1 => (true, true, false),
+        CapabilitySet::V10_1 => enabled(true),
         CapabilitySet::V10_3 { flags } => {
             enabled(!flags.contains(CapabilitiesV103Flags::AVC_DISABLED))
         }
@@ -123,8 +131,35 @@ fn codec_mode(cap: &CapabilitySet) -> (bool, bool, bool) {
         }
     }
 }
-const fn enabled(value: bool) -> (bool, bool, bool) {
-    (value, value, !value)
+const fn enabled(value: bool) -> CodecSupport {
+    CodecSupport {
+        avc420: value,
+        avc444: value,
+    }
+}
+
+const fn disabled() -> CodecSupport {
+    enabled(false)
+}
+
+fn bitmap_fallback_state() -> HandlerState {
+    HandlerState {
+        is_ready: true,
+        negotiated_mode: Some(NegotiatedEgfxMode::Bitmap),
+        needs_android_pointer_updates: true,
+        ..HandlerState::default()
+    }
+}
+
+fn select_mode(policy: EgfxCodecPolicy, support: CodecSupport) -> NegotiatedEgfxMode {
+    match policy {
+        EgfxCodecPolicy::Bitmap => NegotiatedEgfxMode::Bitmap,
+        EgfxCodecPolicy::Avc444 if support.avc444 => NegotiatedEgfxMode::Avc444,
+        EgfxCodecPolicy::Avc420 if support.avc420 => NegotiatedEgfxMode::Avc420,
+        EgfxCodecPolicy::Auto if support.avc444 => NegotiatedEgfxMode::Avc444,
+        EgfxCodecPolicy::Auto if support.avc420 => NegotiatedEgfxMode::Avc420,
+        _ => NegotiatedEgfxMode::Bitmap,
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -132,10 +167,54 @@ mod tests {
     #[test]
     fn v81_requires_flag() {
         assert_eq!(
-            codec_mode(&CapabilitySet::V8_1 {
+            codec_support(&CapabilitySet::V8_1 {
                 flags: CapabilitiesV81Flags::empty()
             }),
-            (false, false, true)
+            disabled()
+        );
+    }
+
+    #[test]
+    fn policy_is_intersected_with_wire_support() {
+        let avc = CodecSupport {
+            avc420: true,
+            avc444: true,
+        };
+        assert_eq!(
+            select_mode(EgfxCodecPolicy::Auto, avc),
+            NegotiatedEgfxMode::Avc444
+        );
+        assert_eq!(
+            select_mode(EgfxCodecPolicy::Avc420, avc),
+            NegotiatedEgfxMode::Avc420
+        );
+        assert_eq!(
+            select_mode(EgfxCodecPolicy::Bitmap, avc),
+            NegotiatedEgfxMode::Bitmap
+        );
+        assert_eq!(
+            select_mode(EgfxCodecPolicy::Avc444, disabled()),
+            NegotiatedEgfxMode::Bitmap
+        );
+    }
+
+    #[test]
+    fn negotiation_failure_state_releases_pipeline_to_bitmap() {
+        let state = bitmap_fallback_state();
+        assert!(state.is_ready);
+        assert_eq!(state.negotiated_mode, Some(NegotiatedEgfxMode::Bitmap));
+        assert!(!state.is_avc420_enabled);
+        assert!(!state.is_avc444_enabled);
+    }
+
+    #[test]
+    fn avc_disabled_capability_selects_bitmap() {
+        let support = codec_support(&CapabilitySet::V10_7 {
+            flags: CapabilitiesV107Flags::AVC_DISABLED,
+        });
+        assert_eq!(
+            select_mode(EgfxCodecPolicy::Auto, support),
+            NegotiatedEgfxMode::Bitmap
         );
     }
 }

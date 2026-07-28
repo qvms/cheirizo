@@ -196,7 +196,7 @@ impl Config {
         require_choice(
             "EGFX codec",
             &self.egfx.codec,
-            &["avc420", "avc444", "auto"],
+            &["avc420", "avc444", "auto", "bitmap"],
         )?;
         require_choice(
             "damage tracking method",

@@ -11,7 +11,8 @@ mod input_handler;
 pub mod production;
 
 pub use crate::rdp::channels::graphics::egfx::channel::{
-    EgfxChannelFactory, EgfxChannelSender, HandlerState, NegotiatedEgfxMode, SharedHandlerState,
+    EgfxChannelFactory, EgfxChannelSender, EgfxCodecPolicy, HandlerState, NegotiatedEgfxMode,
+    SharedHandlerState,
 };
 pub use display_handler::DisplayChannelHandler;
 pub use input_handler::InputChannelHandler;
