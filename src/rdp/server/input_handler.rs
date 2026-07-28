@@ -318,6 +318,10 @@ pub struct InputChannelHandler {
     /// Whether the Android workaround cursor bitmap was already sent this connection.
     pointer_shape_sent: Arc<AtomicBool>,
 
+    /// Bounded diagnostics proving the client delivered input without logging content.
+    first_keyboard_event: Arc<AtomicBool>,
+    first_mouse_event: Arc<AtomicBool>,
+
     /// Whether CJK clipboard-paste fallback is enabled (from config)
     cjk_paste_enabled: bool,
 
@@ -478,6 +482,8 @@ impl InputChannelHandler {
             pointer_update_tx,
             gfx_handler_state,
             pointer_shape_sent,
+            first_keyboard_event: Arc::new(AtomicBool::new(false)),
+            first_mouse_event: Arc::new(AtomicBool::new(false)),
             cjk_paste_enabled,
             clipboard_provider,
         })
@@ -1092,11 +1098,17 @@ impl InputChannelHandler {
 
 impl RdpServerInputHandler for InputChannelHandler {
     fn keyboard(&mut self, event: IronKeyboardEvent) {
+        if !self.first_keyboard_event.swap(true, Ordering::Relaxed) {
+            info!("First RDP keyboard event received");
+        }
         trace!("⌨️  Input multiplexer: routing keyboard to queue");
         self.enqueue_input(InputEvent::Keyboard(event), "keyboard");
     }
 
     fn mouse(&mut self, event: IronMouseEvent) {
+        if !self.first_mouse_event.swap(true, Ordering::Relaxed) {
+            info!("First RDP mouse event received");
+        }
         trace!("🖱️  Input multiplexer: routing mouse to queue");
         self.enqueue_input(InputEvent::Mouse(event), "mouse");
     }
@@ -1115,6 +1127,8 @@ impl Clone for InputChannelHandler {
             pointer_update_tx: self.pointer_update_tx.clone(),
             gfx_handler_state: self.gfx_handler_state.clone(),
             pointer_shape_sent: Arc::clone(&self.pointer_shape_sent),
+            first_keyboard_event: Arc::clone(&self.first_keyboard_event),
+            first_mouse_event: Arc::clone(&self.first_mouse_event),
             cjk_paste_enabled: self.cjk_paste_enabled,
             clipboard_provider: self.clipboard_provider.clone(),
         }
