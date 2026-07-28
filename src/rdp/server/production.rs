@@ -147,6 +147,10 @@ pub async fn run(config: Config) -> Result<()> {
         .with_no_input()
         .with_display_handler(ProductionPlaceholderDisplay)
         .with_bitmap_codecs(codecs)
+        // Preserve the desktop requested during initial capability exchange.
+        // Without this, a later correction emits an avoidable Deactivate-All
+        // cycle before the first graphics surface is usable.
+        .with_honor_client_desktop_size(true)
         .with_cliprdr_factory(cliprdr_factory)
         .with_gfx_factory(gfx_factory)
         .with_sound_factory(None)

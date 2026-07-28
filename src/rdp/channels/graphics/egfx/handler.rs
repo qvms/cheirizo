@@ -64,6 +64,13 @@ impl GraphicsPipelineHandler for WrdpGraphicsHandler {
             mode == NegotiatedEgfxMode::Avc420,
             mode == NegotiatedEgfxMode::Avc444,
         );
+        tracing::info!(
+            policy = ?self.policy,
+            selected = mode.name(),
+            wire_avc420 = support.avc420,
+            wire_avc444 = support.avc444,
+            "graphics mode selected"
+        );
         self.publish(Some(HandlerState {
             is_ready: true,
             negotiated_mode: Some(mode),
@@ -75,9 +82,17 @@ impl GraphicsPipelineHandler for WrdpGraphicsHandler {
         }));
     }
     fn on_capability_negotiation_failed(&mut self) {
+        tracing::warn!(
+            reason = "capability-negotiation-failed",
+            "graphics fallback selected"
+        );
         self.publish(Some(bitmap_fallback_state()))
     }
     fn on_close(&mut self) {
+        tracing::warn!(
+            reason = "rdpgfx-channel-closed",
+            "graphics fallback selected"
+        );
         self.publish(Some(bitmap_fallback_state()))
     }
     fn max_frames_in_flight(&self) -> u32 {

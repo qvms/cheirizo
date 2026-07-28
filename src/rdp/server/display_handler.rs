@@ -104,8 +104,6 @@ use crate::{
 #[cfg(feature = "vaapi")]
 use crate::rdp::channels::graphics::egfx::{HardwareEncoder, create_hardware_encoder};
 
-static LOGGED_FIRST_BITMAP_UPDATE: AtomicBool = AtomicBool::new(false);
-
 /// Client-initiated resize request
 ///
 /// Sent from `request_layout()` (sync context) to the pipeline loop (async)
@@ -1068,6 +1066,7 @@ impl DisplayChannelHandler {
             let mut frames_sent = 0u64;
             let mut frames_dropped = 0u64;
             let mut egfx_frames_sent = 0u64;
+            let mut bitmap_frames_sent = 0u64;
 
             let mut loop_iterations = 0u64;
 
@@ -1218,8 +1217,9 @@ impl DisplayChannelHandler {
                     .and_then(|mut resize| resize.take_ready(std::time::Instant::now()));
                 if let Some(req) = latest_resize {
                     info!(
-                        "Direct-channel resize requested: {}x{}; updating compositor, RDP desktop, and EGFX surfaces",
-                        req.width, req.height
+                        width = req.width,
+                        height = req.height,
+                        "resize request applying"
                     );
 
                     if let Err(e) = handler
@@ -2291,8 +2291,19 @@ impl DisplayChannelHandler {
                                 };
 
                                 match send_result {
-                                    Ok(_frame_id) => {
+                                    Ok(frame_id) => {
                                         egfx_frames_sent += 1;
+                                        if egfx_frames_sent == 1 {
+                                            info!(
+                                                frame_id,
+                                                codec = encoder.codec_name(),
+                                                display_width = frame.width,
+                                                display_height = frame.height,
+                                                encoded_width,
+                                                encoded_height,
+                                                "first EGFX frame submitted"
+                                            );
+                                        }
                                         if egfx_frames_sent.is_multiple_of(30) {
                                             let codec = encoder.codec_name();
                                             debug!(
@@ -2499,6 +2510,18 @@ impl DisplayChannelHandler {
                     );
                 }
 
+                if !iron_updates.is_empty() && bitmap_frames_sent == 0 {
+                    let first = &iron_updates[0];
+                    info!(
+                        width = first.width.get(),
+                        height = first.height.get(),
+                        stride = first.stride.get(),
+                        rectangles = iron_updates.len(),
+                        "first FastPath bitmap frame submitted"
+                    );
+                }
+                bitmap_frames_sent = bitmap_frames_sent.saturating_add(iron_updates.len() as u64);
+
                 if let Some(ref graphics_tx) = handler.graphics_tx {
                     for iron_bitmap in iron_updates {
                         let graphics_frame = GraphicsFrame::new(iron_bitmap, frames_sent);
@@ -2572,20 +2595,6 @@ impl DisplayChannelHandler {
                 data: Bytes::from(rect_data.data.clone()),
                 stride,
             };
-
-            if !LOGGED_FIRST_BITMAP_UPDATE.swap(true, Ordering::Relaxed) {
-                info!(
-                    "First IronRDP bitmap update: x={} y={} width={} height={} format={:?} stride={} data_len={} expected_compact_len={}",
-                    iron_bitmap.x,
-                    iron_bitmap.y,
-                    iron_bitmap.width.get(),
-                    iron_bitmap.height.get(),
-                    iron_bitmap.format,
-                    iron_bitmap.stride.get(),
-                    iron_bitmap.data.len(),
-                    width as usize * height as usize * bytes_per_pixel,
-                );
-            }
 
             iron_updates.push(iron_bitmap);
         }
@@ -2782,7 +2791,12 @@ impl RdpServerDisplay for DisplayChannelHandler {
                     width: new_w,
                     height: new_h,
                 });
-                debug!(queued = resize.queued.len(), "Resize request queued");
+                info!(
+                    width = new_w,
+                    height = new_h,
+                    queued = resize.queued.len(),
+                    "resize request queued"
+                );
             }
             Err(error) => error!("Resize coordinator lock poisoned: {error}"),
         }
