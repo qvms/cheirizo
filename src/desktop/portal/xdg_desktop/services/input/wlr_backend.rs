@@ -73,6 +73,12 @@ unsafe impl Sync for XkbData {}
 /// Wayland keyboard keymap format constant (XKB v1).
 const WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1: u32 = 1;
 
+fn keymap_payload(keymap: &str) -> Vec<u8> {
+    let mut payload = keymap.trim_end_matches('\0').as_bytes().to_vec();
+    payload.push(0);
+    payload
+}
+
 /// wlr virtual input backend.
 ///
 /// Implements the [`InputBackend`] trait using wlroots virtual input protocols.
@@ -247,7 +253,7 @@ impl WlrInputBackend {
 
         use nix::sys::memfd;
 
-        let keymap_bytes = keymap_string.as_bytes();
+        let keymap_bytes = keymap_payload(keymap_string);
         let keymap_size = keymap_bytes.len() as u32;
 
         // Create a memfd for the keymap data
@@ -256,7 +262,7 @@ impl WlrInputBackend {
 
         // Write keymap bytes to the memfd
         let mut file = std::fs::File::from(memfd);
-        file.write_all(keymap_bytes)
+        file.write_all(&keymap_bytes)
             .map_err(|e| PortalError::Config(format!("Failed to write keymap to memfd: {e}")))?;
 
         // Send the keymap to the virtual keyboard
@@ -450,6 +456,12 @@ impl InputBackend for WlrInputBackend {
         }
 
         self.flush()?;
+        // Ensure the compositor has processed virtual-device creation and the
+        // keyboard keymap before input callbacks can enqueue events. A flush
+        // only writes requests; roundtrip also surfaces protocol errors.
+        self.event_queue
+            .roundtrip(&mut self.state)
+            .map_err(|e| PortalError::Wayland(format!("input context roundtrip failed: {e}")))?;
         self.sessions.insert(session_id.to_string(), ctx);
 
         tracing::info!("wlr virtual input context created");
@@ -794,6 +806,12 @@ impl Dispatch<WlSeat, ()> for WlrState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_keyboard_keymap_is_nul_terminated_once() {
+        assert_eq!(keymap_payload("xkb_keymap {}"), b"xkb_keymap {}\0");
+        assert_eq!(keymap_payload("xkb_keymap {}\0\0"), b"xkb_keymap {}\0");
+    }
 
     #[test]
     fn test_wlr_state_default() {
