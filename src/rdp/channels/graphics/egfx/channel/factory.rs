@@ -183,6 +183,11 @@ impl EgfxChannelFactory {
         self
     }
 
+    #[cfg(test)]
+    fn codec_policy(&self) -> EgfxCodecPolicy {
+        self.codec_policy
+    }
+
     /// Get shared reference to handler state
     ///
     /// This can be used by the display handler to check if EGFX is ready
@@ -287,5 +292,34 @@ impl GfxServerFactory for EgfxChannelFactory {
         let bridge = GfxDvcBridge::new(Arc::clone(&server));
 
         Some((bridge, server))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codec_policy_parser_rejects_unknown_values() {
+        assert_eq!(EgfxCodecPolicy::parse("auto"), Some(EgfxCodecPolicy::Auto));
+        assert_eq!(
+            EgfxCodecPolicy::parse("avc420"),
+            Some(EgfxCodecPolicy::Avc420)
+        );
+        assert_eq!(
+            EgfxCodecPolicy::parse("avc444"),
+            Some(EgfxCodecPolicy::Avc444)
+        );
+        assert_eq!(
+            EgfxCodecPolicy::parse("bitmap"),
+            Some(EgfxCodecPolicy::Bitmap)
+        );
+        assert_eq!(EgfxCodecPolicy::parse("planar"), None);
+    }
+
+    #[test]
+    fn factory_carries_explicit_bitmap_policy() {
+        let factory = EgfxChannelFactory::new(1280, 720).with_codec_policy(EgfxCodecPolicy::Bitmap);
+        assert_eq!(factory.codec_policy(), EgfxCodecPolicy::Bitmap);
     }
 }

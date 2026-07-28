@@ -10,6 +10,8 @@ HOLD_SECONDS=${WRDP_TEST_HOLD_SECONDS:-20}
 OUTPUT=${WRDP_TEST_OUTPUT:-"$(pwd)/.local/rdp-compat/$(date +%Y%m%d-%H%M%S)"}
 DISPLAY_NUMBER=${WRDP_TEST_DISPLAY:-:97}
 CLIENT=${WRDP_TEST_CLIENT:-xfreerdp3}
+RECONNECTS=${WRDP_TEST_RECONNECTS:-3}
+RECONNECT_SPACING=${WRDP_TEST_RECONNECT_SPACING:-5}
 SIZES=(864x635 1376x960 1280x720 1920x1080)
 
 mkdir -p "$OUTPUT/raw"
@@ -33,6 +35,8 @@ cleanup() {
 trap cleanup EXIT INT TERM
 sleep 1
 export DISPLAY=$DISPLAY_NUMBER
+h264_build=$($CLIENT /buildconfig 2>/dev/null | grep -q 'WITH_GFX_H264=ON' && echo yes || echo no)
+printf 'client_h264=%s\n' "$h264_build" >"$OUTPUT/environment.txt"
 printf 'mode\tsize\trc\tduration_s\tactive\tgfx_confirm\tsurface\tavc420\tdecode_error\tdeactivate\terror_200d\n' >"$OUTPUT/results.tsv"
 
 run_case() {
@@ -68,6 +72,43 @@ for size in "${SIZES[@]}"; do run_case gfx "$size"; done
 for size in "${SIZES[@]}"; do run_case bitmap "$size"; done
 run_case rfx 1280x720
 run_case progressive 1280x720
+
+for attempt in $(seq 1 "$RECONNECTS"); do
+    run_case "gfx" 1280x720
+    sleep "$RECONNECT_SPACING"
+done
+
+if [[ ${WRDP_TEST_DYNAMIC:-0} == 1 ]]; then
+    if command -v openbox >/dev/null && command -v xdotool >/dev/null; then
+        openbox >"$OUTPUT/raw/openbox.log" 2>&1 &
+        openbox_pid=$!
+        printf '%s\n' "$password" | timeout $((HOLD_SECONDS + 40)) "$CLIENT" \
+            "/v:$TARGET" "/u:$USER_NAME" /from-stdin:force /cert:ignore /size:1280x720 \
+            /gfx +dynamic-resolution /wm-class:WRDPCompatProbe /network:lan /timeout:10000 \
+            /log-level:TRACE >"$OUTPUT/raw/dynamic.log" 2>&1 &
+        dynamic_pid=$!
+        window=''
+        for _ in $(seq 1 20); do
+            window=$(xdotool search --class WRDPCompatProbe 2>/dev/null | head -1 || true)
+            [[ -n $window ]] && break
+            sleep 1
+        done
+        if [[ -n $window ]]; then
+            for dimensions in '864 635' '1376 960' '1280 720' '1920 1080'; do
+                read -r width height <<<"$dimensions"
+                printf '%s\t%sx%s\n' "$(date -Is)" "$width" "$height" >>"$OUTPUT/dynamic-events.tsv"
+                xdotool windowsize "$window" "$width" "$height"
+                sleep 8
+            done
+        else
+            printf 'dynamic\tSKIP\twindow-not-found\n' >"$OUTPUT/dynamic-events.tsv"
+        fi
+        wait "$dynamic_pid" || true
+        kill "$openbox_pid" 2>/dev/null || true
+    else
+        printf 'dynamic\tSKIP\txdotool-or-openbox-unavailable\n' >"$OUTPUT/dynamic-events.tsv"
+    fi
+fi
 
 # Produce bounded evidence without host, certificate, user, frame, or clipboard data.
 awk -F '\t' 'NR == 1 || NR > 1 { print }' "$OUTPUT/results.tsv"

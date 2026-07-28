@@ -434,6 +434,10 @@ pub struct DisplayChannelHandler {
     health_reporter: Arc<RwLock<Option<crate::rdp::session::supervision::SessionStatusReporter>>>,
 }
 
+fn starts_in_bitmap_mode(config: &crate::config::Config) -> bool {
+    !config.egfx.enabled || config.egfx.codec == "bitmap"
+}
+
 fn replace_desktop_size(size: &mut DesktopSize, width: u16, height: u16) -> bool {
     if (size.width, size.height) == (width, height) {
         return false;
@@ -1154,7 +1158,7 @@ impl DisplayChannelHandler {
             // EGFX negotiation failed. Bypass the EGFX gate and deliver frames via
             // FastPath bitmap only. Without this, clients without DVC get zero frames.
             let egfx_timeout = std::time::Duration::from_secs(5);
-            let mut egfx_gate_bypassed = false;
+            let mut egfx_gate_bypassed = starts_in_bitmap_mode(&self.config);
             let mut was_client_active = false;
             // Direct-channel capture (portal-generic) learns the authoritative
             // source dimensions from frames, not PipeWire stream metadata. Track
@@ -2865,6 +2869,16 @@ impl RdpServerDisplayUpdates for DisplayUpdatesStream {
 mod tests {
     use super::*;
     use crate::rdp::channels::graphics::bitmap::converter::{BitmapData, Rectangle};
+
+    #[test]
+    fn explicit_bitmap_policy_bypasses_egfx_without_timeout() {
+        let mut config = crate::config::Config::default();
+        assert!(!starts_in_bitmap_mode(&config));
+        config.egfx.codec = "bitmap".into();
+        assert!(starts_in_bitmap_mode(&config));
+        config.egfx.enabled = false;
+        assert!(starts_in_bitmap_mode(&config));
+    }
 
     #[test]
     fn identical_desktop_size_is_not_published_twice() {
