@@ -177,6 +177,15 @@ compositor-build: ## Build the vendored wrdp compositor.
 compositor-clean: ## Remove the vendored compositor build directory.
 	rm -rf $(COMPOSITOR_BUILD_DIR)
 
+.PHONY: install-session-defaults
+install-session-defaults: ## Install managed compositor and minimal Waybar defaults.
+	$(SUDO) install -d -m 0755 /etc/wrdp/labwc /etc/wrdp/waybar
+	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/labwc/autostart /etc/wrdp/labwc/autostart
+	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/labwc/menu.xml /etc/wrdp/labwc/menu.xml
+	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/labwc/rc.xml /etc/wrdp/labwc/rc.xml
+	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/waybar/config.jsonc /etc/wrdp/waybar/config.jsonc
+	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/waybar/style.css /etc/wrdp/waybar/style.css
+
 .PHONY: validate-production
 validate-production: metadata fmt ## Run release-oriented Rust and compositor gates.
 	$(CARGO_ENV) $(CARGO) check --locked --lib --bins --all-features

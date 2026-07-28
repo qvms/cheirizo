@@ -1,4 +1,11 @@
 # wrdp compositor session autostart
 # Set a sane default desktop size before the RDP server captures the output.
 wlr-randr --output HEADLESS-1 --custom-mode 1920x1080 || true
+
+# Minimal managed-session taskbar. Keep startup optional so compositor-only
+# development installs remain usable without the Waybar package.
+if command -v waybar >/dev/null 2>&1; then
+    waybar --config /etc/wrdp/waybar/config.jsonc --style /etc/wrdp/waybar/style.css &
+fi
+
 foot --window-size-pixels=828x380 --title="~/Desktop" sh -lc 'printf "\033]0;~/Desktop\007"; clear; exec sh' &

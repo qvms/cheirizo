@@ -1,0 +1,20 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 28,
+  "spacing": 4,
+  "modules-left": ["wlr/taskbar"],
+  "modules-right": ["clock"],
+  "wlr/taskbar": {
+    "format": "{title}",
+    "icon-size": 16,
+    "tooltip-format": "{app_id}: {title}",
+    "on-click": "activate",
+    "on-click-middle": "close",
+    "ignore-list": ["waybar"]
+  },
+  "clock": {
+    "format": "{:%a %d %b  %H:%M}",
+    "tooltip-format": "{:%Y-%m-%d %H:%M:%S %Z}"
+  }
+}

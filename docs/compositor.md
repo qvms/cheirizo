@@ -15,6 +15,23 @@ WRDP uses standard Wayland/wlroots protocols exposed by the compositor:
 
 The managed production path receives screencopy frames through an in-process channel after connecting to the user's Wayland socket. It does not need a GNOME/KDE portal or a PipeWire video stream. PipeWire remains available for the separate portal and audio paths.
 
+## Default session UI
+
+The managed session starts a small terminal and, when installed, a minimal
+[Waybar](https://github.com/Alexays/Waybar) taskbar. WRDP's default Waybar
+configuration uses only `wlr/taskbar` and `clock`; it does not poll network,
+audio, power or tray services. The bar is optional: compositor startup checks
+for the `waybar` executable and continues normally when it is absent.
+
+Install the managed-session defaults with:
+
+```bash
+sudo apt install waybar
+make install-session-defaults
+```
+
+Files are installed under `/etc/wrdp/labwc` and `/etc/wrdp/waybar`.
+
 ## Build boundary
 
 Meson builds the compositor as a GPL-2.0-only executable. It is installed at:

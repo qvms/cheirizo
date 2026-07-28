@@ -1,0 +1,36 @@
+* {
+  border: none;
+  border-radius: 0;
+  min-height: 0;
+  font-family: sans-serif;
+  font-size: 12px;
+}
+
+window#waybar {
+  background: #d4d0c8;
+  color: #111111;
+  border-bottom: 1px solid #808080;
+}
+
+#taskbar button {
+  padding: 2px 8px;
+  color: #111111;
+  background: transparent;
+  border-left: 1px solid transparent;
+  border-right: 1px solid transparent;
+}
+
+#taskbar button.active {
+  background: #ece9d8;
+  border-left-color: #ffffff;
+  border-right-color: #808080;
+}
+
+#taskbar button:hover {
+  background: #e4e1d5;
+}
+
+#clock {
+  padding: 2px 10px;
+  border-left: 1px solid #808080;
+}
