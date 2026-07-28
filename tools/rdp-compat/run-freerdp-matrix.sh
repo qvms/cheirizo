@@ -40,7 +40,8 @@ printf 'client_h264=%s\n' "$h264_build" >"$OUTPUT/environment.txt"
 printf 'mode\tsize\trc\tduration_s\tactive\tgfx_confirm\tsurface\tavc420\tdecode_error\tdeactivate\terror_200d\n' >"$OUTPUT/results.tsv"
 
 run_case() {
-    local mode=$1 size=$2 log="$OUTPUT/raw/${mode}-${size}.log" rc start duration
+    local mode=$1 size=$2 rc start duration
+    local log="$OUTPUT/raw/${mode}-${size}.log"
     local -a graphics
     case "$mode" in
         gfx) graphics=(/gfx) ;;
