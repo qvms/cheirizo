@@ -321,6 +321,7 @@ pub struct InputChannelHandler {
     /// Bounded diagnostics proving the client delivered input without logging content.
     first_keyboard_event: Arc<AtomicBool>,
     first_mouse_event: Arc<AtomicBool>,
+    first_mouse_button_event: Arc<AtomicBool>,
 
     /// Whether CJK clipboard-paste fallback is enabled (from config)
     cjk_paste_enabled: bool,
@@ -484,6 +485,7 @@ impl InputChannelHandler {
             pointer_shape_sent,
             first_keyboard_event: Arc::new(AtomicBool::new(false)),
             first_mouse_event: Arc::new(AtomicBool::new(false)),
+            first_mouse_button_event: Arc::new(AtomicBool::new(false)),
             cjk_paste_enabled,
             clipboard_provider,
         })
@@ -1109,6 +1111,17 @@ impl RdpServerInputHandler for InputChannelHandler {
         if !self.first_mouse_event.swap(true, Ordering::Relaxed) {
             info!("First RDP mouse event received");
         }
+        if matches!(
+            event,
+            IronMouseEvent::LeftPressed
+                | IronMouseEvent::RightPressed
+                | IronMouseEvent::MiddlePressed
+                | IronMouseEvent::Button4Pressed
+                | IronMouseEvent::Button5Pressed
+        ) && !self.first_mouse_button_event.swap(true, Ordering::Relaxed)
+        {
+            info!("First RDP pointer button event received");
+        }
         trace!("🖱️  Input multiplexer: routing mouse to queue");
         self.enqueue_input(InputEvent::Mouse(event), "mouse");
     }
@@ -1129,6 +1142,7 @@ impl Clone for InputChannelHandler {
             pointer_shape_sent: Arc::clone(&self.pointer_shape_sent),
             first_keyboard_event: Arc::clone(&self.first_keyboard_event),
             first_mouse_event: Arc::clone(&self.first_mouse_event),
+            first_mouse_button_event: Arc::clone(&self.first_mouse_button_event),
             cjk_paste_enabled: self.cjk_paste_enabled,
             clipboard_provider: self.clipboard_provider.clone(),
         }
