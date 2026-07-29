@@ -2597,8 +2597,13 @@ impl DisplayChannelHandler {
                                 trace!("Bitmap update queue full; dropping stale frame");
                             }
                             Err(e) => {
-                                error!("Failed to send display update: {e}");
-                                return;
+                                // Deactivate-Reactivate swaps the display update
+                                // channel. A frame racing that swap belongs to the
+                                // old generation; drop it and retry through the new
+                                // sender on the next loop instead of killing the
+                                // connection-wide display pipeline.
+                                frames_dropped = frames_dropped.saturating_add(1);
+                                debug!(%e, "Dropping bitmap for closed display generation");
                             }
                         }
                     }
