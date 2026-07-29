@@ -420,6 +420,30 @@ impl ConnectionBinder for ProductionSesmanBinder {
     }
 }
 
+fn prime_direct_frame_receiver(
+    source: std::sync::mpsc::Receiver<crate::desktop::pipewire::frame::RawFrameData>,
+    timeout: std::time::Duration,
+) -> Result<std::sync::mpsc::Receiver<crate::desktop::pipewire::frame::RawFrameData>> {
+    let first = source
+        .recv_timeout(timeout)
+        .context("timed out waiting for first managed-session frame")?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("primed-frame-forwarder".into())
+        .spawn(move || {
+            if sender.send(first).is_err() {
+                return;
+            }
+            for frame in source {
+                if sender.send(frame).is_err() {
+                    break;
+                }
+            }
+        })
+        .context("failed to spawn primed frame forwarder")?;
+    Ok(receiver)
+}
+
 async fn build_production_portal_generic_connection(
     username: &str,
     wayland_socket: PathBuf,
@@ -485,6 +509,12 @@ async fn build_production_portal_generic_connection(
             .map_or((1920, 1080), |s| (s.size.0 as u16, s.size.1 as u16));
 
         let raw_rx = session_handle.direct_frame_receiver()?;
+        let raw_rx = tokio::task::spawn_blocking(move || {
+            prime_direct_frame_receiver(raw_rx, std::time::Duration::from_secs(2))
+        })
+        .await
+        .context("first-frame priming task panicked")??;
+        info!("Managed-session capture primed before RDP activation");
 
         let display_handler = Arc::new(
             DisplayChannelHandler::new_direct(
@@ -681,6 +711,30 @@ impl RdpServerDisplayUpdates for ProductionNoopUpdates {
 mod tests {
     use super::*;
     use crate::rdp::server::EgfxCodecPolicy;
+
+    #[test]
+    fn first_frame_is_preserved_when_capture_is_primed() {
+        let (sender, source) = std::sync::mpsc::channel();
+        sender
+            .send(crate::desktop::pipewire::frame::RawFrameData {
+                data: vec![1, 2, 3, 4],
+                width: Some(1),
+                height: Some(1),
+                stride: Some(4),
+                format: None,
+            })
+            .unwrap();
+        drop(sender);
+        let receiver =
+            prime_direct_frame_receiver(source, std::time::Duration::from_millis(10)).unwrap();
+        assert_eq!(receiver.recv().unwrap().data, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn first_frame_priming_times_out_cleanly() {
+        let (_sender, source) = std::sync::mpsc::channel();
+        assert!(prime_direct_frame_receiver(source, std::time::Duration::from_millis(1)).is_err());
+    }
 
     #[test]
     fn hardware_auto_policy_uses_avc420() {

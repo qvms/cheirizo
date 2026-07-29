@@ -429,6 +429,9 @@ pub struct DisplayChannelHandler {
     /// Ordered, bounded resize requests serialized across core reactivation.
     resize: Arc<std::sync::Mutex<ResizeCoordinator>>,
 
+    /// Stops this connection-owned pipeline permanently during cleanup.
+    pipeline_stop: Arc<std::sync::atomic::AtomicBool>,
+
     /// Whether a client is actively connected and consuming frames.
     /// Set true on new connection (in `updates()`), false on disconnect.
     /// The pipeline loop checks this to avoid encoding/sending frames to nobody.
@@ -773,6 +776,7 @@ impl DisplayChannelHandler {
                 initial_width,
                 initial_height,
             ))),
+            pipeline_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             client_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             health_reporter: Arc::new(RwLock::new(None)),
         })
@@ -823,6 +827,8 @@ impl DisplayChannelHandler {
 
     /// Release references that keep connection-owned input/session resources alive.
     pub async fn release_connection_resources(&self) {
+        self.pipeline_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self.on_client_disconnect();
         self.input_handler.write().await.take();
         self.clipboard_manager.write().await.take();
@@ -1216,6 +1222,13 @@ impl DisplayChannelHandler {
             let mut pts_interval_max_ms: f64 = 0.0;
 
             loop {
+                if handler
+                    .pipeline_stop
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    info!("Display pipeline stopping for released connection");
+                    break;
+                }
                 loop_iterations += 1;
                 if loop_iterations.is_multiple_of(1000) {
                     if pts_interval_count > 0 {
@@ -2882,6 +2895,7 @@ impl Clone for DisplayChannelHandler {
             input_handler: Arc::clone(&self.input_handler), // Share input handler ref
             clipboard_manager: Arc::clone(&self.clipboard_manager), // Share clipboard manager ref
             resize: Arc::clone(&self.resize),
+            pipeline_stop: Arc::clone(&self.pipeline_stop),
             client_active: Arc::clone(&self.client_active),
             health_reporter: Arc::clone(&self.health_reporter),
         }
