@@ -336,7 +336,6 @@ pub struct InputChannelHandler {
 
     /// Bounded diagnostics proving the client delivered input without logging content.
     first_keyboard_event: Arc<AtomicBool>,
-    keyboard_diagnostic_count: Arc<AtomicU64>,
     first_mouse_event: Arc<AtomicBool>,
     first_mouse_button_event: Arc<AtomicBool>,
 
@@ -466,7 +465,6 @@ impl InputChannelHandler {
             gfx_handler_state,
             pointer_shape_sent,
             first_keyboard_event: Arc::new(AtomicBool::new(false)),
-            keyboard_diagnostic_count: Arc::new(AtomicU64::new(0)),
             first_mouse_event: Arc::new(AtomicBool::new(false)),
             first_mouse_button_event: Arc::new(AtomicBool::new(false)),
             keyboard_layout: keyboard_layout.to_string(),
@@ -1183,12 +1181,6 @@ impl InputChannelHandler {
 
 impl RdpServerInputHandler for InputChannelHandler {
     fn keyboard(&mut self, event: IronKeyboardEvent) {
-        let diagnostic_index = self
-            .keyboard_diagnostic_count
-            .fetch_add(1, Ordering::Relaxed);
-        if diagnostic_index < 8 {
-            info!(diagnostic_index, ?event, "RDP keyboard transition received");
-        }
         if !self.first_keyboard_event.swap(true, Ordering::Relaxed) {
             info!("First RDP keyboard event received");
         }
@@ -1231,7 +1223,6 @@ impl Clone for InputChannelHandler {
             gfx_handler_state: self.gfx_handler_state.clone(),
             pointer_shape_sent: Arc::clone(&self.pointer_shape_sent),
             first_keyboard_event: Arc::clone(&self.first_keyboard_event),
-            keyboard_diagnostic_count: Arc::clone(&self.keyboard_diagnostic_count),
             first_mouse_event: Arc::clone(&self.first_mouse_event),
             first_mouse_button_event: Arc::clone(&self.first_mouse_button_event),
             keyboard_layout: self.keyboard_layout.clone(),
