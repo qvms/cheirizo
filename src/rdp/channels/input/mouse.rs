@@ -98,6 +98,9 @@ pub struct MouseHandler {
     /// Last event timestamp
     last_event_time: Option<Instant>,
 
+    /// Release timestamps used to suppress a delayed duplicate transport path.
+    last_button_release: [Option<Instant>; 5],
+
     /// Enable high-precision scrolling
     high_precision_scroll: bool,
 
@@ -114,6 +117,7 @@ impl MouseHandler {
             current_y: 0.0,
             button_states: [false; 5],
             last_event_time: None,
+            last_button_release: [None; 5],
             high_precision_scroll: true,
             scroll_accum_x: 0.0,
             scroll_accum_y: 0.0,
@@ -173,11 +177,30 @@ impl MouseHandler {
     /// Accept only real button-state transitions. Clients that send both core
     /// and Advanced Input events can otherwise duplicate a physical click.
     pub fn accept_button_transition(&mut self, button: MouseButton, pressed: bool) -> bool {
+        self.accept_button_transition_at(button, pressed, Instant::now())
+    }
+
+    fn accept_button_transition_at(
+        &mut self,
+        button: MouseButton,
+        pressed: bool,
+        now: Instant,
+    ) -> bool {
+        const DUPLICATE_PATH_WINDOW: std::time::Duration = std::time::Duration::from_millis(8);
         let index = Self::button_to_index(button);
         if self.button_states[index] == pressed {
             return false;
         }
+        if pressed
+            && self.last_button_release[index]
+                .is_some_and(|released| now.duration_since(released) < DUPLICATE_PATH_WINDOW)
+        {
+            return false;
+        }
         self.button_states[index] = pressed;
+        if !pressed {
+            self.last_button_release[index] = Some(now);
+        }
         true
     }
 
@@ -231,6 +254,19 @@ impl MouseHandler {
         (self.current_x, self.current_y)
     }
 
+    pub fn pressed_buttons(&self) -> Vec<MouseButton> {
+        [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Extra1,
+            MouseButton::Extra2,
+        ]
+        .into_iter()
+        .filter(|button| self.is_button_pressed(*button))
+        .collect()
+    }
+
     /// Check if button is currently pressed
     pub fn is_button_pressed(&self, button: MouseButton) -> bool {
         let index = Self::button_to_index(button);
@@ -265,6 +301,7 @@ impl MouseHandler {
     /// Reset mouse state
     pub fn reset(&mut self) {
         self.button_states = [false; 5];
+        self.last_button_release = [None; 5];
         self.scroll_accum_x = 0.0;
         self.scroll_accum_y = 0.0;
     }
@@ -304,10 +341,29 @@ mod tests {
     #[test]
     fn duplicate_button_states_are_suppressed() {
         let mut mouse = MouseHandler::new();
-        assert!(mouse.accept_button_transition(MouseButton::Left, true));
-        assert!(!mouse.accept_button_transition(MouseButton::Left, true));
-        assert!(mouse.accept_button_transition(MouseButton::Left, false));
-        assert!(!mouse.accept_button_transition(MouseButton::Left, false));
+        let start = Instant::now();
+        assert!(mouse.accept_button_transition_at(MouseButton::Left, true, start));
+        assert!(!mouse.accept_button_transition_at(MouseButton::Left, true, start));
+        assert!(mouse.accept_button_transition_at(
+            MouseButton::Left,
+            false,
+            start + std::time::Duration::from_millis(1)
+        ));
+        assert!(!mouse.accept_button_transition_at(
+            MouseButton::Left,
+            true,
+            start + std::time::Duration::from_millis(2)
+        ));
+        assert!(!mouse.accept_button_transition_at(
+            MouseButton::Left,
+            false,
+            start + std::time::Duration::from_millis(3)
+        ));
+        assert!(mouse.accept_button_transition_at(
+            MouseButton::Left,
+            true,
+            start + std::time::Duration::from_millis(20)
+        ));
     }
 
     #[test]

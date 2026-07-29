@@ -227,6 +227,9 @@ impl CoordinateTransformer {
 
     /// Transform RDP coordinates to stream coordinates
     pub fn rdp_to_stream(&mut self, rdp_x: u32, rdp_y: u32) -> Result<(f64, f64)> {
+        self.last_rdp_x = rdp_x.min(self.coord_system.rdp_width.saturating_sub(1));
+        self.last_rdp_y = rdp_y.min(self.coord_system.rdp_height.saturating_sub(1));
+
         // Step 1: Normalize RDP coordinates to [0, 1] range
         let norm_x = rdp_x as f64 / self.coord_system.rdp_width as f64;
         let norm_y = rdp_y as f64 / self.coord_system.rdp_height as f64;
@@ -592,6 +595,21 @@ mod tests {
         let mut monitor = create_test_monitor();
         monitor.stream_x = u32::MAX;
         assert!(CoordinateTransformer::new(vec![monitor]).is_err());
+    }
+
+    #[test]
+    fn relative_movement_continues_from_last_absolute_position() {
+        let monitor = create_test_monitor();
+        let mut transformer = CoordinateTransformer::new(vec![monitor]).unwrap();
+        transformer.set_acceleration_enabled(false);
+        assert_eq!(
+            transformer.rdp_to_stream(1000, 500).unwrap(),
+            (1000.0, 500.0)
+        );
+        assert_eq!(
+            transformer.apply_relative_movement(10, -10).unwrap(),
+            (1010.0, 490.0)
+        );
     }
 
     #[test]

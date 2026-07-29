@@ -189,7 +189,7 @@ impl WlrInputBackend {
 
         // Initialize XKB keymap for keysym-to-keycode conversion and
         // virtual keyboard keymap setup.
-        Self::init_xkb(&mut state)?;
+        Self::init_xkb(&mut state, &config.keyboard_layout)?;
 
         Ok(Self {
             connection,
@@ -205,18 +205,18 @@ impl WlrInputBackend {
     ///
     /// Creates a default "us" layout keymap. The serialized keymap string
     /// is stored for passing to virtual keyboards via memfd.
-    fn init_xkb(state: &mut WlrState) -> Result<()> {
+    fn init_xkb(state: &mut WlrState, layout: &str) -> Result<()> {
         use xkbcommon::xkb;
 
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
 
         let keymap = xkb::Keymap::new_from_names(
             &context,
-            "",   // rules (empty = default "evdev")
-            "",   // model (empty = default)
-            "",   // layout (empty = default "us")
-            "",   // variant (empty = default)
-            None, // options
+            "",     // rules (empty = default "evdev")
+            "",     // model (empty = default)
+            layout, // configured XKB layout
+            "",     // variant (empty = default)
+            None,   // options
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         )
         .ok_or_else(|| {
@@ -227,7 +227,8 @@ impl WlrInputBackend {
         let xkb_state = xkb::State::new(&keymap);
 
         tracing::info!(
-            "XKB keymap initialized (default us layout, {} bytes)",
+            "XKB keymap initialized (layout={}, {} bytes)",
+            layout,
             keymap_string.len()
         );
 
@@ -376,26 +377,41 @@ impl WlrInputBackend {
         Ok(())
     }
 
-    /// Compute the total extent (bounding box) of all known outputs.
-    ///
-    /// Returns `(width, height)` covering all output regions. If no stream
-    /// mappings are set, falls back to a reasonable default.
-    fn compute_total_extent(&self) -> (u32, u32) {
+    /// Compute compositor-global bounds, including outputs left/above origin.
+    fn compute_output_bounds(&self) -> (i32, i32, u32, u32) {
         if self.stream_mappings.is_empty() {
-            return (1920, 1080); // Reasonable default for single-monitor
+            return (0, 0, 1920, 1080);
         }
-
-        let mut max_x: i32 = 0;
-        let mut max_y: i32 = 0;
-
-        for mapping in self.stream_mappings.values() {
-            let right = mapping.x + mapping.width as i32;
-            let bottom = mapping.y + mapping.height as i32;
-            max_x = max_x.max(right);
-            max_y = max_y.max(bottom);
-        }
-
-        (max_x.max(1) as u32, max_y.max(1) as u32)
+        let min_x = self
+            .stream_mappings
+            .values()
+            .map(|m| m.x)
+            .min()
+            .unwrap_or(0);
+        let min_y = self
+            .stream_mappings
+            .values()
+            .map(|m| m.y)
+            .min()
+            .unwrap_or(0);
+        let max_x = self
+            .stream_mappings
+            .values()
+            .map(|m| i64::from(m.x) + i64::from(m.width))
+            .max()
+            .unwrap_or(1);
+        let max_y = self
+            .stream_mappings
+            .values()
+            .map(|m| i64::from(m.y) + i64::from(m.height))
+            .max()
+            .unwrap_or(1);
+        (
+            min_x,
+            min_y,
+            (max_x - i64::from(min_x)).max(1) as u32,
+            (max_y - i64::from(min_y)).max(1) as u32,
+        )
     }
 
     /// Flush the Wayland connection.
@@ -522,13 +538,18 @@ impl InputBackend for WlrInputBackend {
                         let pixel_x = mapping.x as f64 + x * mapping.width as f64;
                         let pixel_y = mapping.y as f64 + y * mapping.height as f64;
 
-                        // Compute total compositor extent from all known outputs.
-                        let (total_width, total_height) = self.compute_total_extent();
+                        let (origin_x, origin_y, total_width, total_height) =
+                            self.compute_output_bounds();
 
-                        // Normalize to extent range for wlr_virtual_pointer protocol.
+                        // Normalize translated global coordinates for the
+                        // wlr-virtual-pointer absolute extent.
                         let extent = 10000u32;
-                        let abs_x = ((pixel_x / total_width as f64) * extent as f64) as u32;
-                        let abs_y = ((pixel_y / total_height as f64) * extent as f64) as u32;
+                        let abs_x = ((((pixel_x - f64::from(origin_x)) / f64::from(total_width))
+                            .clamp(0.0, 1.0))
+                            * f64::from(extent)) as u32;
+                        let abs_y = ((((pixel_y - f64::from(origin_y)) / f64::from(total_height))
+                            .clamp(0.0, 1.0))
+                            * f64::from(extent)) as u32;
 
                         pointer.motion_absolute(time_ms(time_usec), abs_x, abs_y, extent, extent);
                     } else {
@@ -826,7 +847,7 @@ mod tests {
     #[test]
     fn test_xkb_initialization() {
         let mut state = WlrState::default();
-        WlrInputBackend::init_xkb(&mut state).expect("XKB init should succeed");
+        WlrInputBackend::init_xkb(&mut state, "us").expect("XKB init should succeed");
 
         let xkb = state.xkb.as_ref().expect("XKB data should be set");
         assert!(
@@ -843,7 +864,7 @@ mod tests {
     #[test]
     fn test_keysym_to_keycode_via_xkb() {
         let mut state = WlrState::default();
-        WlrInputBackend::init_xkb(&mut state).unwrap();
+        WlrInputBackend::init_xkb(&mut state, "us").unwrap();
 
         let xkb_data = state.xkb.as_ref().unwrap();
         let keymap = &xkb_data.keymap;

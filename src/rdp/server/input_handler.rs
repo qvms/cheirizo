@@ -2,17 +2,14 @@
 //!
 //! IronRDP delivers keyboard and pointer callbacks synchronously, while the
 //! managed compositor session accepts asynchronous input injection. This module
-//! queues those callbacks, batches them on a short timer, translates keyboard
+//! queues those callbacks in order, translates keyboard
 //! and pointer details, and forwards them to the active session handle. Android
 //! pointer workarounds and CJK clipboard-paste fallback are kept here because
 //! both are driven by incoming client input events.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Instant,
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use ironrdp_pdu::pointer::PointerPositionAttribute;
@@ -276,14 +273,32 @@ fn portal_err(e: impl std::fmt::Display) -> InputError {
 /// active session handle.
 ///
 /// IronRDP callbacks are synchronous while injection calls are async, so this
-/// module uses queued/batched forwarding to keep input responsive.
-/// Input event for batching/multiplexing
+/// module uses ordered forwarding to keep input responsive.
+/// Input event for multiplexing
 #[derive(Debug)]
 pub enum InputEvent {
     /// Keyboard event from RDP client
     Keyboard(IronKeyboardEvent),
     /// Mouse event from RDP client
     Mouse(IronMouseEvent),
+}
+
+fn input_event_is_droppable(event: &InputEvent) -> bool {
+    match event {
+        InputEvent::Keyboard(
+            IronKeyboardEvent::Released { .. } | IronKeyboardEvent::UnicodeReleased(_),
+        ) => false,
+        InputEvent::Keyboard(IronKeyboardEvent::Synchronize(_)) => false,
+        InputEvent::Keyboard(_) => true,
+        InputEvent::Mouse(
+            IronMouseEvent::LeftReleased
+            | IronMouseEvent::RightReleased
+            | IronMouseEvent::MiddleReleased
+            | IronMouseEvent::Button4Released
+            | IronMouseEvent::Button5Released,
+        ) => false,
+        InputEvent::Mouse(_) => true,
+    }
 }
 
 /// Input handler that bridges IronRDP events to runtime input injection.
@@ -306,8 +321,9 @@ pub struct InputChannelHandler {
     /// Primary stream node ID used for pointer/input injection routing.
     primary_stream_id: u32,
 
-    /// Input event queue sender (for multiplexer - bounded with drop policy)
-    input_tx: mpsc::Sender<InputEvent>,
+    /// Ordered input event queue plus a soft backlog bound.
+    input_tx: mpsc::UnboundedSender<InputEvent>,
+    queued_events: Arc<std::sync::atomic::AtomicUsize>,
 
     /// Display update channel used only for Android RD Client pointer workaround PDUs.
     pointer_update_tx: Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
@@ -323,6 +339,9 @@ pub struct InputChannelHandler {
     first_mouse_event: Arc<AtomicBool>,
     first_mouse_button_event: Arc<AtomicBool>,
 
+    /// Configured scancode/XKB layout, preserved across reconnect resets.
+    keyboard_layout: String,
+
     /// Whether CJK clipboard-paste fallback is enabled (from config)
     cjk_paste_enabled: bool,
 
@@ -335,15 +354,22 @@ impl InputChannelHandler {
         session_handle: Arc<dyn crate::rdp::session::SessionHandle>,
         monitors: Vec<MonitorInfo>,
         primary_stream_id: u32,
-        input_tx: mpsc::Sender<InputEvent>,
+        input_tx: mpsc::UnboundedSender<InputEvent>,
         pointer_update_tx: Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
         gfx_handler_state: Option<Arc<RwLock<Option<HandlerState>>>>,
-        mut input_rx: mpsc::Receiver<InputEvent>,
+        mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        keyboard_layout: &str,
         cjk_paste_enabled: bool,
         clipboard_provider: Option<Arc<dyn ClipboardProvider>>,
     ) -> Result<Self, InputError> {
-        let keyboard_handler = Arc::new(Mutex::new(KeyboardHandler::new()));
+        let mut keyboard = KeyboardHandler::new();
+        keyboard.set_layout(if keyboard_layout == "auto" {
+            "us"
+        } else {
+            keyboard_layout
+        });
+        let keyboard_handler = Arc::new(Mutex::new(keyboard));
         let mouse_handler = Arc::new(Mutex::new(MouseHandler::new()));
 
         let coordinate_transformer = Arc::new(Mutex::new(CoordinateTransformer::new(monitors)?));
@@ -364,114 +390,68 @@ impl InputChannelHandler {
         let pointer_update_tx_task = pointer_update_tx.clone();
         let gfx_handler_state_task = gfx_handler_state.clone();
         let pointer_shape_sent = Arc::new(AtomicBool::new(false));
+        let queued_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queued_events_task = Arc::clone(&queued_events);
         let pointer_shape_sent_task = Arc::clone(&pointer_shape_sent);
 
         tokio::spawn(async move {
-            let mut keyboard_batch = Vec::with_capacity(16);
-            let mut mouse_batch = Vec::with_capacity(16);
-            let mut last_flush = Instant::now();
-            let batch_interval = tokio::time::Duration::from_millis(10);
             let mut cjk_buffer = CjkPasteBuffer::new();
-
-            // Rate-limit input injection errors to avoid log spam when the
-            // portal session becomes unresponsive (e.g. PipeWire stream pauses)
             let consecutive_mouse_errors = AtomicU64::new(0);
             let consecutive_kbd_errors = AtomicU64::new(0);
 
             loop {
                 tokio::select! {
-                    Some(event) = input_rx.recv() => {
-                        match event {
-                            InputEvent::Keyboard(kbd) => {
-                                trace!("📥 Input queue: received keyboard event");
-                                keyboard_batch.push(kbd);
+                    event = input_rx.recv() => {
+                        let Some(event) = event else { break };
+                        queued_events_task.fetch_sub(1, Ordering::Relaxed);
+                        let result = match event {
+                            InputEvent::Keyboard(event) => {
+                                Self::handle_keyboard_event_impl(
+                                    &session_handle_clone,
+                                    &keyboard_clone,
+                                    event,
+                                    &mut cjk_buffer,
+                                    cjk_enabled_task,
+                                    &clipboard_provider_task,
+                                ).await.map_err(|error| ("keyboard", error))
                             }
-                            InputEvent::Mouse(mouse) => {
-                                trace!("📥 Input queue: received mouse event");
-                                mouse_batch.push(mouse);
+                            InputEvent::Mouse(event) => {
+                                Self::handle_mouse_event_impl(
+                                    &session_handle_clone,
+                                    &mouse_clone,
+                                    &coord_clone,
+                                    event,
+                                    primary_stream_id,
+                                    &pointer_update_tx_task,
+                                    &gfx_handler_state_task,
+                                    &pointer_shape_sent_task,
+                                ).await.map_err(|error| ("mouse", error))
+                            }
+                        };
+                        match result {
+                            Ok(()) => {
+                                consecutive_mouse_errors.store(0, Ordering::Relaxed);
+                                consecutive_kbd_errors.store(0, Ordering::Relaxed);
+                            }
+                            Err((kind, error)) => {
+                                let counter = if kind == "mouse" {
+                                    &consecutive_mouse_errors
+                                } else {
+                                    &consecutive_kbd_errors
+                                };
+                                let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                                if count == 1 || count.is_power_of_two() {
+                                    warn!(kind, count, %error, "Portal input injection failed");
+                                }
                             }
                         }
                     }
-
-                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(last_flush + batch_interval)) => {
-                        // Process keyboard batch
-                        if !keyboard_batch.is_empty() {
-                            trace!("🔄 Input batching: flushing {} keyboard events", keyboard_batch.len());
-                        }
-                        for kbd_event in keyboard_batch.drain(..) {
-                            if let Err(e) = Self::handle_keyboard_event_impl(
-                                &session_handle_clone,
-                                &keyboard_clone,
-                                kbd_event,
-                                &mut cjk_buffer,
-                                cjk_enabled_task,
-                                &clipboard_provider_task,
-                            ).await {
-                                let count = consecutive_kbd_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                                if count == 1 {
-                                    warn!("Portal keyboard injection failed: {e}");
-                                } else if count.is_power_of_two() {
-                                    warn!("Portal keyboard injection failed ({count} consecutive): {e}");
-                                }
-                            } else {
-                                let prev = consecutive_kbd_errors.swap(0, Ordering::Relaxed);
-                                if prev > 1 {
-                                    info!("Portal keyboard injection recovered after {prev} failures");
-                                }
-                            }
-                        }
-
-                        // Process mouse batch
-                        if !mouse_batch.is_empty() {
-                            trace!("🔄 Input batching: flushing {} mouse events", mouse_batch.len());
-                        }
-                        for mouse_event in mouse_batch.drain(..) {
-                            if let Err(e) = Self::handle_mouse_event_impl(
-                                &session_handle_clone,
-                                &mouse_clone,
-                                &coord_clone,
-                                mouse_event,
-                                primary_stream_id,
-                                &pointer_update_tx_task,
-                                &gfx_handler_state_task,
-                                &pointer_shape_sent_task,
-                            ).await {
-                                let count = consecutive_mouse_errors.fetch_add(1, Ordering::Relaxed) + 1;
-                                if count == 1 {
-                                    warn!("Portal mouse injection failed: {e}");
-                                } else if count.is_power_of_two() {
-                                    warn!("Portal mouse injection failed ({count} consecutive): {e}");
-                                }
-                            } else {
-                                let prev = consecutive_mouse_errors.swap(0, Ordering::Relaxed);
-                                if prev > 1 {
-                                    info!("Portal mouse injection recovered after {prev} failures");
-                                }
-                            }
-                        }
-
-                        last_flush = Instant::now();
-                    }
-
-                    _ = shutdown_rx.recv() => {
-                        info!("🛑 Input batching task received shutdown signal");
-                        break;
-                    }
+                    _ = shutdown_rx.recv() => break,
                 }
             }
-
-            let mouse_errs = consecutive_mouse_errors.load(Ordering::Relaxed);
-            let kbd_errs = consecutive_kbd_errors.load(Ordering::Relaxed);
-            if mouse_errs > 0 || kbd_errs > 0 {
-                info!(
-                    "Input batching task stopped (pending errors: mouse={mouse_errs}, kbd={kbd_errs})"
-                );
-            } else {
-                info!("Input batching task stopped");
-            }
+            info!("Input event worker stopped");
         });
-
-        info!("Input batching task started (REAL task, 10ms flush interval)");
+        info!("Ordered input event worker started");
 
         Ok(Self {
             session_handle,
@@ -480,12 +460,14 @@ impl InputChannelHandler {
             coordinate_transformer,
             primary_stream_id,
             input_tx,
+            queued_events,
             pointer_update_tx,
             gfx_handler_state,
             pointer_shape_sent,
             first_keyboard_event: Arc::new(AtomicBool::new(false)),
             first_mouse_event: Arc::new(AtomicBool::new(false)),
             first_mouse_button_event: Arc::new(AtomicBool::new(false)),
+            keyboard_layout: keyboard_layout.to_string(),
             cjk_paste_enabled,
             clipboard_provider,
         })
@@ -496,25 +478,53 @@ impl InputChannelHandler {
     /// Resets internal state to handle new client connection.
     /// Call this when reconnection is detected (e.g., display_updates channel recreated).
     fn enqueue_input(&self, event: InputEvent, label: &'static str) {
-        if let Err(e) = self.input_tx.try_send(event) {
-            error!("Failed to queue {label} event for batching: {e}");
+        const SOFT_LIMIT: usize = 4096;
+        let queued = self.queued_events.load(Ordering::Relaxed);
+        if queued >= SOFT_LIMIT && input_event_is_droppable(&event) {
+            trace!(label, queued, "Dropping coalescible input under backlog");
+            return;
+        }
+        self.queued_events.fetch_add(1, Ordering::Relaxed);
+        if let Err(error) = self.input_tx.send(event) {
+            self.queued_events.fetch_sub(1, Ordering::Relaxed);
+            error!(%error, "Failed to queue {label} input event");
         }
     }
 
     pub async fn notify_reconnection(&self) {
         info!("🔄 Input handler: Client reconnected, resetting state");
 
-        {
-            let mut kbd = self.keyboard_handler.lock().await;
-            *kbd = KeyboardHandler::new();
-            debug!("Keyboard handler state reset");
+        let pressed_keys = self.keyboard_handler.lock().await.get_pressed_keys();
+        for keycode in pressed_keys {
+            if let Err(error) = self
+                .session_handle
+                .notify_keyboard_keycode(keycode as i32, false)
+                .await
+            {
+                warn!(%error, keycode, "Failed to release key during reconnect");
+            }
+        }
+        let pressed_buttons = self.mouse_handler.lock().await.pressed_buttons();
+        for button in pressed_buttons {
+            if let Err(error) = self
+                .session_handle
+                .notify_pointer_button(button.to_linux_button() as i32, false)
+                .await
+            {
+                warn!(%error, ?button, "Failed to release pointer button during reconnect");
+            }
         }
 
         {
-            let mut mouse = self.mouse_handler.lock().await;
-            *mouse = MouseHandler::new();
-            debug!("Mouse handler state reset");
+            let mut keyboard = KeyboardHandler::new();
+            keyboard.set_layout(if self.keyboard_layout == "auto" {
+                "us"
+            } else {
+                &self.keyboard_layout
+            });
+            *self.keyboard_handler.lock().await = keyboard;
         }
+        *self.mouse_handler.lock().await = MouseHandler::new();
 
         self.pointer_shape_sent.store(false, Ordering::Release);
         debug!("Android pointer workaround state reset");
@@ -627,8 +637,8 @@ impl InputChannelHandler {
                     | crate::rdp::channels::input::KeyboardEvent::KeyRepeat { keycode, .. } => {
                         keycode
                     }
+                    crate::rdp::channels::input::KeyboardEvent::Ignored { .. } => return Ok(()),
                     crate::rdp::channels::input::KeyboardEvent::KeyUp { keycode, .. } => {
-                        // handle_key_down returned KeyUp (shouldn't happen but handle gracefully)
                         warn!("handle_key_down returned KeyUp; using translated keycode");
                         keycode
                     }
@@ -655,6 +665,7 @@ impl InputChannelHandler {
 
                 let keycode = match kbd_event {
                     crate::rdp::channels::input::KeyboardEvent::KeyUp { keycode, .. } => keycode,
+                    crate::rdp::channels::input::KeyboardEvent::Ignored { .. } => return Ok(()),
                     _ => {
                         return Err(InputError::InvalidKeyEvent(
                             "Unexpected event type".to_string(),
@@ -741,12 +752,24 @@ impl InputChannelHandler {
                 }
             }
 
-            IronKeyboardEvent::Synchronize(_flags) => {
-                debug!("Keyboard state synchronization received");
-                // Update toggle key states based on sync flags
-                // The flags tell us the client's current Caps/Num/Scroll lock states
-                // We should sync our local state but portal doesn't have direct sync API
-                // This is handled implicitly when keys are pressed
+            IronKeyboardEvent::Synchronize(flags) => {
+                use ironrdp_pdu::input::fast_path::SynchronizeFlags;
+                let toggles = keyboard.synchronize_locks(
+                    flags.contains(SynchronizeFlags::CAPS_LOCK),
+                    flags.contains(SynchronizeFlags::NUM_LOCK),
+                    flags.contains(SynchronizeFlags::SCROLL_LOCK),
+                );
+                drop(keyboard);
+                for keycode in toggles {
+                    session_handle
+                        .notify_keyboard_keycode(keycode as i32, true)
+                        .await
+                        .map_err(portal_err)?;
+                    session_handle
+                        .notify_keyboard_keycode(keycode as i32, false)
+                        .await
+                        .map_err(portal_err)?;
+                }
             }
         }
 
@@ -1042,6 +1065,9 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::MiddlePressed => {
+                if !mouse.accept_button_transition(MouseButton::Middle, true) {
+                    return Ok(());
+                }
                 mouse.handle_button_down(MouseButton::Middle)?;
                 session_handle
                     .notify_pointer_button(274, true) // BTN_MIDDLE
@@ -1050,6 +1076,9 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::MiddleReleased => {
+                if !mouse.accept_button_transition(MouseButton::Middle, false) {
+                    return Ok(());
+                }
                 mouse.handle_button_up(MouseButton::Middle)?;
                 session_handle
                     .notify_pointer_button(274, false)
@@ -1058,6 +1087,9 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::Button4Pressed => {
+                if !mouse.accept_button_transition(MouseButton::Extra1, true) {
+                    return Ok(());
+                }
                 mouse.handle_button_down(MouseButton::Extra1)?;
                 session_handle
                     .notify_pointer_button(275, true) // BTN_SIDE
@@ -1066,6 +1098,9 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::Button4Released => {
+                if !mouse.accept_button_transition(MouseButton::Extra1, false) {
+                    return Ok(());
+                }
                 mouse.handle_button_up(MouseButton::Extra1)?;
                 session_handle
                     .notify_pointer_button(275, false)
@@ -1074,6 +1109,9 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::Button5Pressed => {
+                if !mouse.accept_button_transition(MouseButton::Extra2, true) {
+                    return Ok(());
+                }
                 mouse.handle_button_down(MouseButton::Extra2)?;
                 session_handle
                     .notify_pointer_button(276, true) // BTN_EXTRA
@@ -1082,6 +1120,9 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::Button5Released => {
+                if !mouse.accept_button_transition(MouseButton::Extra2, false) {
+                    return Ok(());
+                }
                 mouse.handle_button_up(MouseButton::Extra2)?;
                 session_handle
                     .notify_pointer_button(276, false)
@@ -1090,23 +1131,47 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::VerticalScroll { value } => {
-                // RDP scroll units are in 120ths
-                mouse.handle_scroll(0, value as i32)?;
-                let delta_y = (value as f64 / 120.0) * 15.0;
-                session_handle
-                    .notify_pointer_axis(0.0, delta_y)
-                    .await
-                    .map_err(portal_err)?;
+                let event = mouse.handle_scroll(0, value as i32)?;
+                if let crate::rdp::channels::input::MouseEvent::Scroll {
+                    delta_x, delta_y, ..
+                } = event
+                {
+                    if delta_x != 0 || delta_y != 0 {
+                        session_handle
+                            .notify_pointer_axis(
+                                f64::from(delta_x) * 15.0,
+                                f64::from(delta_y) * 15.0,
+                            )
+                            .await
+                            .map_err(portal_err)?;
+                        session_handle
+                            .notify_pointer_axis(0.0, 0.0)
+                            .await
+                            .map_err(portal_err)?;
+                    }
+                }
             }
 
             IronMouseEvent::Scroll { x, y } => {
-                mouse.handle_scroll(x, y)?;
-                let delta_x = (x as f64 / 120.0) * 15.0;
-                let delta_y = (y as f64 / 120.0) * 15.0;
-                session_handle
-                    .notify_pointer_axis(delta_x, delta_y)
-                    .await
-                    .map_err(portal_err)?;
+                let event = mouse.handle_scroll(x, y)?;
+                if let crate::rdp::channels::input::MouseEvent::Scroll {
+                    delta_x, delta_y, ..
+                } = event
+                {
+                    if delta_x != 0 || delta_y != 0 {
+                        session_handle
+                            .notify_pointer_axis(
+                                f64::from(delta_x) * 15.0,
+                                f64::from(delta_y) * 15.0,
+                            )
+                            .await
+                            .map_err(portal_err)?;
+                        session_handle
+                            .notify_pointer_axis(0.0, 0.0)
+                            .await
+                            .map_err(portal_err)?;
+                    }
+                }
             }
         }
 
@@ -1153,12 +1218,14 @@ impl Clone for InputChannelHandler {
             coordinate_transformer: Arc::clone(&self.coordinate_transformer),
             primary_stream_id: self.primary_stream_id,
             input_tx: self.input_tx.clone(),
+            queued_events: Arc::clone(&self.queued_events),
             pointer_update_tx: self.pointer_update_tx.clone(),
             gfx_handler_state: self.gfx_handler_state.clone(),
             pointer_shape_sent: Arc::clone(&self.pointer_shape_sent),
             first_keyboard_event: Arc::clone(&self.first_keyboard_event),
             first_mouse_event: Arc::clone(&self.first_mouse_event),
             first_mouse_button_event: Arc::clone(&self.first_mouse_button_event),
+            keyboard_layout: self.keyboard_layout.clone(),
             cjk_paste_enabled: self.cjk_paste_enabled,
             clipboard_provider: self.clipboard_provider.clone(),
         }
@@ -1167,8 +1234,7 @@ impl Clone for InputChannelHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::CjkPasteBuffer;
-    use super::unicode_to_keysym;
+    use super::*;
 
     #[test]
     fn unicode_to_keysym_maps_bmp_cjk_to_xkb_unicode_keysym() {
@@ -1191,6 +1257,22 @@ mod tests {
     fn test_input_handler_clone() {
         // Verify clone compiles and works
         // Full tests require portal mocking
+    }
+
+    #[test]
+    fn backlog_policy_never_drops_release_or_sync_events() {
+        assert!(!input_event_is_droppable(&InputEvent::Keyboard(
+            IronKeyboardEvent::Released {
+                code: 0x1e,
+                extended: false
+            }
+        )));
+        assert!(!input_event_is_droppable(&InputEvent::Mouse(
+            IronMouseEvent::LeftReleased
+        )));
+        assert!(input_event_is_droppable(&InputEvent::Mouse(
+            IronMouseEvent::Move { x: 1, y: 1 }
+        )));
     }
 
     #[test]

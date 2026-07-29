@@ -225,7 +225,7 @@ pub struct EisConfig {
 }
 
 /// wlr virtual input specific configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WlrConfig {
     /// Wayland display to connect to.
     ///
@@ -236,6 +236,19 @@ pub struct WlrConfig {
     ///
     /// Takes precedence over `wayland_display` and the process environment.
     pub wayland_socket_path: Option<PathBuf>,
+
+    /// XKB layout used by the virtual keyboard (for example `us` or `pt`).
+    pub keyboard_layout: String,
+}
+
+impl Default for WlrConfig {
+    fn default() -> Self {
+        Self {
+            wayland_display: None,
+            wayland_socket_path: None,
+            keyboard_layout: "us".into(),
+        }
+    }
 }
 
 /// Create an input backend based on configuration and Wayland protocol availability.

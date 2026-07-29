@@ -62,6 +62,10 @@ impl PortalStartupSettings {
             preferred: InputProtocol::WlrVirtualInput,
             ..InputBackendConfig::default()
         };
+        input.wlr.keyboard_layout = match config.input.keyboard_layout.as_str() {
+            "auto" => "us".into(),
+            layout => layout.to_string(),
+        };
 
         if let Some(value) = environment.get("XDP_GENERIC_CAPTURE_PROTOCOL") {
             capture.preferred = capture_protocol(value)?;

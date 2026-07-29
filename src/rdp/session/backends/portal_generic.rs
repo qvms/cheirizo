@@ -291,10 +291,6 @@ fn normalize_absolute_pointer_position(
     x: f64,
     y: f64,
 ) -> (f64, f64) {
-    if x <= 1.0 && y <= 1.0 {
-        return (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
-    }
-
     let stream = streams
         .iter()
         .find(|stream| stream.node_id == stream_id)
@@ -408,6 +404,22 @@ impl SessionHandle for PortalGenericSessionHandle {
     }
 
     fn set_streams(&self, streams: Vec<StreamInfo>) {
+        if let Ok(mut backend) = self.input_backend.lock() {
+            backend.set_stream_mappings(
+                streams
+                    .iter()
+                    .map(
+                        |stream| crate::desktop::portal::xdg_desktop::types::StreamOutputMapping {
+                            stream_node_id: stream.node_id,
+                            x: stream.position_x,
+                            y: stream.position_y,
+                            width: stream.width,
+                            height: stream.height,
+                        },
+                    )
+                    .collect(),
+            );
+        }
         *self
             .streams
             .lock()
@@ -438,7 +450,8 @@ impl SessionHandle for PortalGenericSessionHandle {
         let streams = self
             .streams
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let (x, y) = normalize_absolute_pointer_position(&streams, stream_id, x, y);
         if !self
             .first_pointer_event
@@ -504,6 +517,14 @@ mod tests {
     fn test_current_time_usec() {
         let time = current_time_usec();
         assert!(time > 0);
+    }
+
+    #[test]
+    fn one_pixel_is_not_misclassified_as_normalized() {
+        let streams = vec![StreamInfo::new(7, 1920, 1080, 0, 0)];
+        let (x, y) = normalize_absolute_pointer_position(&streams, 7, 1.0, 1.0);
+        assert!((x - 1.0 / 1920.0).abs() < f64::EPSILON);
+        assert!((y - 1.0 / 1080.0).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -602,7 +602,7 @@ async fn build_production_portal_generic_connection(
             None => None,
         };
 
-        let (input_tx, input_rx) = tokio::sync::mpsc::channel(256);
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
         let input_handler = InputChannelHandler::new(
             session_handle.clone(),
@@ -613,6 +613,7 @@ async fn build_production_portal_generic_connection(
             Some(display_handler.get_gfx_handler_state()),
             input_rx,
             shutdown_rx,
+            &config.input.keyboard_layout,
             config.input.cjk_paste_fallback,
             clipboard_provider,
         )

@@ -31,6 +31,9 @@ pub struct KeyModifiers {
 /// Keyboard event types
 #[derive(Debug, Clone)]
 pub enum KeyboardEvent {
+    /// Duplicate state from overlapping input transports; do not inject.
+    Ignored { keycode: u32 },
+
     /// Key pressed
     KeyDown {
         /// Linux evdev keycode
@@ -79,10 +82,13 @@ pub struct KeyboardHandler {
     /// Current modifiers
     modifiers: KeyModifiers,
 
-    /// Last event timestamp for each key (for repeat detection)
+    /// Last accepted event timestamp for each key.
     last_key_times: std::collections::HashMap<u32, Instant>,
 
-    /// Key repeat delay (milliseconds)
+    /// Keys that have passed the initial repeat delay.
+    repeating_keys: HashSet<u32>,
+
+    /// Key repeat delay (milliseconds).
     repeat_delay_ms: u64,
 
     /// Key repeat rate (milliseconds between repeats)
@@ -97,6 +103,7 @@ impl KeyboardHandler {
             pressed_keys: HashSet::new(),
             modifiers: KeyModifiers::default(),
             last_key_times: std::collections::HashMap::new(),
+            repeating_keys: HashSet::new(),
             repeat_delay_ms: 500,
             repeat_rate_ms: 33,
         }
@@ -120,18 +127,19 @@ impl KeyboardHandler {
         let is_repeat = self.pressed_keys.contains(&keycode);
 
         if is_repeat {
-            // Check repeat timing
-            if let Some(last_time) = self.last_key_times.get(&keycode) {
-                let elapsed = timestamp.duration_since(*last_time).as_millis() as u64;
-                if elapsed < self.repeat_rate_ms {
-                    // Too soon for repeat, return repeat event to maintain state
-                    return Ok(KeyboardEvent::KeyRepeat {
-                        keycode,
-                        scancode,
-                        modifiers: self.modifiers,
-                        timestamp,
-                    });
+            let last = self
+                .last_key_times
+                .get(&keycode)
+                .copied()
+                .unwrap_or(timestamp);
+            let elapsed = timestamp.duration_since(last).as_millis() as u64;
+            if !self.repeating_keys.contains(&keycode) {
+                if elapsed < self.repeat_delay_ms {
+                    return Ok(KeyboardEvent::Ignored { keycode });
                 }
+                self.repeating_keys.insert(keycode);
+            } else if elapsed < self.repeat_rate_ms {
+                return Ok(KeyboardEvent::Ignored { keycode });
             }
         }
 
@@ -173,9 +181,14 @@ impl KeyboardHandler {
 
         let timestamp = Instant::now();
 
+        if !self.pressed_keys.contains(&keycode) {
+            return Ok(KeyboardEvent::Ignored { keycode });
+        }
+
         // Remove from pressed keys
         self.pressed_keys.remove(&keycode);
         self.last_key_times.remove(&keycode);
+        self.repeating_keys.remove(&keycode);
 
         // Update modifiers
         self.update_modifiers(keycode, false);
@@ -246,6 +259,31 @@ impl KeyboardHandler {
         }
     }
 
+    /// Synchronize client lock-key state and return evdev keys that must be
+    /// toggled on the compositor virtual keyboard.
+    pub fn synchronize_locks(
+        &mut self,
+        caps_lock: bool,
+        num_lock: bool,
+        scroll_lock: bool,
+    ) -> Vec<u32> {
+        use crate::rdp::channels::input::mapper::keycodes::{
+            KEY_CAPSLOCK, KEY_NUMLOCK, KEY_SCROLLLOCK,
+        };
+        let mut toggles = Vec::new();
+        for (current, desired, keycode) in [
+            (&mut self.modifiers.caps_lock, caps_lock, KEY_CAPSLOCK),
+            (&mut self.modifiers.num_lock, num_lock, KEY_NUMLOCK),
+            (&mut self.modifiers.scroll_lock, scroll_lock, KEY_SCROLLLOCK),
+        ] {
+            if *current != desired {
+                *current = desired;
+                toggles.push(keycode);
+            }
+        }
+        toggles
+    }
+
     /// Check if a key is currently pressed
     pub fn is_key_pressed(&self, keycode: u32) -> bool {
         self.pressed_keys.contains(&keycode)
@@ -267,7 +305,7 @@ impl KeyboardHandler {
         self.mapper.layout()
     }
 
-    /// Set key repeat delay
+    /// Set initial key repeat delay.
     pub fn set_repeat_delay(&mut self, delay_ms: u64) {
         self.repeat_delay_ms = delay_ms;
     }
@@ -281,6 +319,7 @@ impl KeyboardHandler {
     pub fn reset(&mut self) {
         self.pressed_keys.clear();
         self.last_key_times.clear();
+        self.repeating_keys.clear();
         self.modifiers = KeyModifiers::default();
         debug!("Keyboard state reset");
     }
@@ -305,6 +344,21 @@ impl Default for KeyboardHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_synchronization_returns_only_changed_keys() {
+        use crate::rdp::channels::input::mapper::keycodes::{KEY_CAPSLOCK, KEY_NUMLOCK};
+        let mut keyboard = KeyboardHandler::new();
+        assert_eq!(
+            keyboard.synchronize_locks(true, true, false),
+            vec![KEY_CAPSLOCK, KEY_NUMLOCK]
+        );
+        assert!(keyboard.synchronize_locks(true, true, false).is_empty());
+        assert_eq!(
+            keyboard.synchronize_locks(false, true, false),
+            vec![KEY_CAPSLOCK]
+        );
+    }
 
     #[test]
     fn test_keyboard_handler_creation() {
@@ -479,12 +533,39 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_transport_down_is_not_a_repeat() {
+        let mut handler = KeyboardHandler::new();
+        handler.set_repeat_delay(5);
+        handler.set_repeat_rate(3);
+        assert!(matches!(
+            handler.handle_key_down(0x1E, false, false).unwrap(),
+            KeyboardEvent::KeyDown { .. }
+        ));
+        assert!(matches!(
+            handler.handle_key_down(0x1E, false, false).unwrap(),
+            KeyboardEvent::Ignored { .. }
+        ));
+        std::thread::sleep(std::time::Duration::from_millis(6));
+        assert!(matches!(
+            handler.handle_key_down(0x1E, false, false).unwrap(),
+            KeyboardEvent::KeyRepeat { .. }
+        ));
+        assert!(matches!(
+            handler.handle_key_up(0x1E, false, false).unwrap(),
+            KeyboardEvent::KeyUp { .. }
+        ));
+        assert!(matches!(
+            handler.handle_key_up(0x1E, false, false).unwrap(),
+            KeyboardEvent::Ignored { .. }
+        ));
+    }
+
+    #[test]
     fn test_repeat_rate() {
         let mut handler = KeyboardHandler::new();
 
         handler.set_repeat_delay(100);
         handler.set_repeat_rate(50);
-
         assert_eq!(handler.repeat_delay_ms, 100);
         assert_eq!(handler.repeat_rate_ms, 50);
     }
