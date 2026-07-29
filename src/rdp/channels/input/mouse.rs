@@ -170,11 +170,19 @@ impl MouseHandler {
         })
     }
 
+    /// Accept only real button-state transitions. Clients that send both core
+    /// and Advanced Input events can otherwise duplicate a physical click.
+    pub fn accept_button_transition(&mut self, button: MouseButton, pressed: bool) -> bool {
+        let index = Self::button_to_index(button);
+        if self.button_states[index] == pressed {
+            return false;
+        }
+        self.button_states[index] = pressed;
+        true
+    }
+
     /// Process mouse button press
     pub fn handle_button_down(&mut self, button: MouseButton) -> Result<MouseEvent> {
-        let button_index = Self::button_to_index(button);
-        self.button_states[button_index] = true;
-
         let timestamp = Instant::now();
         self.last_event_time = Some(timestamp);
 
@@ -183,9 +191,6 @@ impl MouseHandler {
 
     /// Process mouse button release
     pub fn handle_button_up(&mut self, button: MouseButton) -> Result<MouseEvent> {
-        let button_index = Self::button_to_index(button);
-        self.button_states[button_index] = false;
-
         let timestamp = Instant::now();
         self.last_event_time = Some(timestamp);
 
@@ -294,6 +299,15 @@ mod tests {
         };
 
         CoordinateTransformer::new(vec![monitor]).unwrap()
+    }
+
+    #[test]
+    fn duplicate_button_states_are_suppressed() {
+        let mut mouse = MouseHandler::new();
+        assert!(mouse.accept_button_transition(MouseButton::Left, true));
+        assert!(!mouse.accept_button_transition(MouseButton::Left, true));
+        assert!(mouse.accept_button_transition(MouseButton::Left, false));
+        assert!(!mouse.accept_button_transition(MouseButton::Left, false));
     }
 
     #[test]

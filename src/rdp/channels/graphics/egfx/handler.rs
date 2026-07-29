@@ -76,6 +76,7 @@ impl GraphicsPipelineHandler for WrdpGraphicsHandler {
             negotiated_mode: Some(mode),
             is_avc420_enabled: avc420,
             is_avc444_enabled: avc444,
+            requires_core_reset: false,
             needs_android_pointer_updates: mode == NegotiatedEgfxMode::Bitmap,
             primary_surface_id: None,
             dvc_channel_id: 0,
@@ -86,14 +87,14 @@ impl GraphicsPipelineHandler for WrdpGraphicsHandler {
             reason = "capability-negotiation-failed",
             "graphics fallback selected"
         );
-        self.publish(Some(bitmap_fallback_state()))
+        self.publish(Some(bitmap_fallback_state(false)))
     }
     fn on_close(&mut self) {
         tracing::warn!(
             reason = "rdpgfx-channel-closed",
             "graphics fallback selected"
         );
-        self.publish(Some(bitmap_fallback_state()))
+        self.publish(Some(bitmap_fallback_state(true)))
     }
     fn max_frames_in_flight(&self) -> u32 {
         self.max_frames
@@ -157,10 +158,11 @@ const fn disabled() -> CodecSupport {
     enabled(false)
 }
 
-fn bitmap_fallback_state() -> HandlerState {
+fn bitmap_fallback_state(requires_core_reset: bool) -> HandlerState {
     HandlerState {
         is_ready: true,
         negotiated_mode: Some(NegotiatedEgfxMode::Bitmap),
+        requires_core_reset,
         needs_android_pointer_updates: true,
         ..HandlerState::default()
     }
@@ -215,11 +217,13 @@ mod tests {
 
     #[test]
     fn negotiation_failure_state_releases_pipeline_to_bitmap() {
-        let state = bitmap_fallback_state();
+        let state = bitmap_fallback_state(false);
         assert!(state.is_ready);
         assert_eq!(state.negotiated_mode, Some(NegotiatedEgfxMode::Bitmap));
         assert!(!state.is_avc420_enabled);
         assert!(!state.is_avc444_enabled);
+        assert!(!state.requires_core_reset);
+        assert!(bitmap_fallback_state(true).requires_core_reset);
     }
 
     #[test]

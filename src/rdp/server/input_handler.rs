@@ -994,6 +994,10 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::LeftPressed => {
+                if !mouse.accept_button_transition(MouseButton::Left, true) {
+                    trace!("Suppressing duplicate left-button press");
+                    return Ok(());
+                }
                 mouse.handle_button_down(MouseButton::Left)?;
                 session_handle
                     .notify_pointer_button(272, true) // BTN_LEFT
@@ -1002,6 +1006,10 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::LeftReleased => {
+                if !mouse.accept_button_transition(MouseButton::Left, false) {
+                    trace!("Suppressing duplicate left-button release");
+                    return Ok(());
+                }
                 mouse.handle_button_up(MouseButton::Left)?;
                 session_handle
                     .notify_pointer_button(272, false)
@@ -1010,6 +1018,10 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::RightPressed => {
+                if !mouse.accept_button_transition(MouseButton::Right, true) {
+                    trace!("Suppressing duplicate right-button press");
+                    return Ok(());
+                }
                 mouse.handle_button_down(MouseButton::Right)?;
                 session_handle
                     .notify_pointer_button(273, true) // BTN_RIGHT
@@ -1018,6 +1030,10 @@ impl InputChannelHandler {
             }
 
             IronMouseEvent::RightReleased => {
+                if !mouse.accept_button_transition(MouseButton::Right, false) {
+                    trace!("Suppressing duplicate right-button release");
+                    return Ok(());
+                }
                 mouse.handle_button_up(MouseButton::Right)?;
                 session_handle
                     .notify_pointer_button(273, false)

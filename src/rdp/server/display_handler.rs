@@ -897,6 +897,29 @@ impl DisplayChannelHandler {
             .and_then(|state| state.negotiated_mode)
     }
 
+    async fn take_core_graphics_reset(&self) -> bool {
+        let mut state = self.gfx_handler_state.write().await;
+        let Some(state) = state.as_mut() else {
+            return false;
+        };
+        std::mem::take(&mut state.requires_core_reset)
+    }
+
+    async fn force_core_graphics_reset(&self) -> bool {
+        let size = *self.size.read().await;
+        info!(
+            width = size.width,
+            height = size.height,
+            "Reactivating core graphics before bitmap fallback"
+        );
+        let sender = self.update_sender.lock().await.clone();
+        if let Err(error) = sender.send(DisplayUpdate::Resize(size)).await {
+            warn!(%error, "Failed to publish core graphics reset");
+            return false;
+        }
+        true
+    }
+
     /// Check if AVC/H.264 is available for the negotiated client mode.
     pub async fn is_avc_supported(&self) -> bool {
         self.negotiated_egfx_mode()
@@ -1726,6 +1749,14 @@ impl DisplayChannelHandler {
                 } else {
                     false
                 };
+
+                if handler.take_core_graphics_reset().await {
+                    video_encoder = None;
+                    egfx_sender = None;
+                    if handler.force_core_graphics_reset().await {
+                        force_first_frame = true;
+                    }
+                }
 
                 let negotiated_egfx_mode = if egfx_gate_bypassed {
                     None

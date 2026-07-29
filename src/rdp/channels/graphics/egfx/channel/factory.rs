@@ -128,6 +128,8 @@ pub struct HandlerState {
     pub is_avc420_enabled: bool,
     /// Whether AVC444 (H.264 YUV444) codec is supported
     pub is_avc444_enabled: bool,
+    /// Whether core graphics must be reactivated before bitmap fallback.
+    pub requires_core_reset: bool,
     /// Whether this client needs Android RD Client pointer workaround updates.
     ///
     /// Android clients that negotiate EGFX with AVC-disabled/Planar do not reliably draw
