@@ -37,8 +37,9 @@ impl PeerAwareValidator for crate::security::StaticPasswordValidator {
 
 use crate::{
     config::Config,
-    rdp::channels::clipboard::{
-        ClipboardOrchestrator, ClipboardOrchestratorConfig, WrdpCliprdrFactory,
+    rdp::channels::{
+        audio::{AudioTarget, WrdpSoundFactory},
+        clipboard::{ClipboardOrchestrator, ClipboardOrchestratorConfig, WrdpCliprdrFactory},
     },
     rdp::server::{DisplayChannelHandler, EgfxChannelFactory, InputChannelHandler},
 };
@@ -79,6 +80,7 @@ pub async fn run(config: Config) -> Result<()> {
 
     let active_bound_user = Arc::new(Mutex::new(None));
     let active_display = Arc::new(Mutex::new(None));
+    let audio_target = AudioTarget::default();
 
     let configured_codec_policy = crate::rdp::server::EgfxCodecPolicy::parse(&config.egfx.codec)
         .context("invalid egfx.codec")?;
@@ -170,7 +172,7 @@ pub async fn run(config: Config) -> Result<()> {
         .with_honor_client_desktop_size(true)
         .with_cliprdr_factory(cliprdr_factory)
         .with_gfx_factory(gfx_factory)
-        .with_sound_factory(None)
+        .with_sound_factory(Some(Box::new(WrdpSoundFactory::new(audio_target.clone()))))
         .build();
 
     let mut peer_validator: Option<Arc<dyn PeerAwareValidator>> = None;
@@ -207,6 +209,7 @@ pub async fn run(config: Config) -> Result<()> {
     rdp_server.set_connection_binder(Some(Arc::new(ProductionSesmanBinder {
         active_bound_user: Arc::clone(&active_bound_user),
         active_display: Arc::clone(&active_display),
+        audio_target: audio_target.clone(),
         config: Arc::new(config.clone()),
         server_event_tx: rdp_server.event_sender().clone(),
         clipboard_manager: clipboard_manager.clone(),
@@ -240,6 +243,7 @@ pub async fn run(config: Config) -> Result<()> {
         if let Some(display) = active_display.lock().await.take() {
             display.release_connection_resources().await;
         }
+        audio_target.clear();
         if let Some(manager) = clipboard_manager.as_ref() {
             manager.lock().await.clear_connection_state().await;
         }
@@ -333,6 +337,7 @@ async fn record_production_disconnect(user: String) {
 struct ProductionSesmanBinder {
     active_bound_user: Arc<Mutex<Option<String>>>,
     active_display: Arc<Mutex<Option<Arc<DisplayChannelHandler>>>>,
+    audio_target: AudioTarget,
     config: Arc<Config>,
     server_event_tx: tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
     clipboard_manager: Option<Arc<Mutex<ClipboardOrchestrator>>>,
@@ -346,6 +351,7 @@ impl ConnectionBinder for ProductionSesmanBinder {
         let username = normalize_local_account_name(&credentials.username);
         let active_bound_user = Arc::clone(&self.active_bound_user);
         let active_display = Arc::clone(&self.active_display);
+        let audio_target = self.audio_target.clone();
         let config = Arc::clone(&self.config);
         let server_event_tx = self.server_event_tx.clone();
         let clipboard_manager = self.clipboard_manager.clone();
@@ -409,6 +415,7 @@ impl ConnectionBinder for ProductionSesmanBinder {
             }
         }
 
+        audio_target.set_runtime_dir(state.xdg_runtime_dir.clone());
         *active_bound_user.lock().await = Some(username.clone());
         *active_display.lock().await = Some(display);
         info!(

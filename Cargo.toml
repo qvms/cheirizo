@@ -87,6 +87,7 @@ ironrdp-egfx = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c
 ironrdp-svc = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
 ironrdp-dvc = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
 ironrdp-graphics = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
+ironrdp-rdpsnd = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
 
 # -----------------------------------------------------------------------------
 
