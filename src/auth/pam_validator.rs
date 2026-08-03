@@ -3,7 +3,8 @@ use super::{
     username::{normalize_local_account_name, validate_username},
 };
 use ironrdp_server::{
-    CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
+    CredentialDecision, CredentialOrigin, CredentialValidationError, CredentialValidator,
+    Credentials,
 };
 #[cfg(feature = "pam-auth")]
 use nonstick::{AuthnFlags, ConversationAdapter, Transaction, TransactionBuilder};
@@ -78,6 +79,7 @@ impl CredentialValidator for PamValidator {
     async fn validate(
         &self,
         c: &Credentials,
+        _origin: CredentialOrigin,
     ) -> Result<CredentialDecision, CredentialValidationError> {
         if validate_username(&c.username).is_err() {
             return Ok(CredentialDecision::Reject);

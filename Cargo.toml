@@ -78,16 +78,16 @@ x509-cert = "0.2.5"
 #
 # Consume the canonical stack branch from rcarmo/IronRDP while the required
 # server-side hooks are prepared as separate upstreamable changes.
-ironrdp-server = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e", features = ["egfx", "helper"] }
-ironrdp-pdu = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
-ironrdp-displaycontrol = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
-ironrdp-cliprdr = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
-ironrdp-core = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
-ironrdp-egfx = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
-ironrdp-svc = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
-ironrdp-dvc = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
-ironrdp-graphics = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
-ironrdp-rdpsnd = { git = "https://github.com/rcarmo/IronRDP.git", rev = "bbd91102c03c1dad18596ad64e8cdd3f249e323e" }
+ironrdp-server = { git = "https://github.com/rcarmo/IronRDP.git", rev = "3db9de002577fc2cf95240065f332369031ed27d", features = ["egfx", "helper"] }
+ironrdp-pdu = { git = "https://github.com/rcarmo/IronRDP.git", rev = "3db9de002577fc2cf95240065f332369031ed27d" }
+ironrdp-displaycontrol = { git = "https://github.com/rcarmo/IronRDP.git", rev = "3db9de002577fc2cf95240065f332369031ed27d" }
+ironrdp-cliprdr = { git = "https://github.com/rcarmo/IronRDP.git", rev = "3db9de002577fc2cf95240065f332369031ed27d" }
+ironrdp-core = { git = "https://github.com/rcarmo/IronRDP.git", rev = "3db9de002577fc2cf95240065f332369031ed27d" }
+ironrdp-egfx = { git = "https://github.com/rcarmo/IronRDP.git", rev = "3db9de002577fc2cf95240065f332369031ed27d" }
+ironrdp-svc = { git = "https://github.com/rcarmo/IronRDP.git", rev = "3db9de002577fc2cf95240065f332369031ed27d" }
+ironrdp-dvc = { git = "https://github.com/rcarmo/IronRDP.git", rev = "3db9de002577fc2cf95240065f332369031ed27d" }
+ironrdp-graphics = { git = "https://github.com/rcarmo/IronRDP.git", rev = "3db9de002577fc2cf95240065f332369031ed27d" }
+ironrdp-rdpsnd = { git = "https://github.com/rcarmo/IronRDP.git", rev = "3db9de002577fc2cf95240065f332369031ed27d" }
 
 # -----------------------------------------------------------------------------
 

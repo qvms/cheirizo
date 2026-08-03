@@ -8,7 +8,8 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
 use ironrdp_server::{
-    CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
+    CredentialDecision, CredentialOrigin, CredentialValidationError, CredentialValidator,
+    Credentials,
 };
 use std::{collections::BTreeMap, net::IpAddr};
 pub struct StaticPasswordValidator {
@@ -56,6 +57,7 @@ impl CredentialValidator for StaticPasswordValidator {
     async fn validate(
         &self,
         c: &Credentials,
+        _origin: CredentialOrigin,
     ) -> Result<CredentialDecision, CredentialValidationError> {
         if validate_username(&c.username).is_err() {
             return Ok(CredentialDecision::Reject);
@@ -94,11 +96,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            v.validate(&Credentials {
-                username: "DOMAIN\\alice".into(),
-                password: "secret".into(),
-                domain: None
-            })
+            v.validate(
+                &Credentials {
+                    username: "DOMAIN\\alice".into(),
+                    password: "secret".into(),
+                    domain: None,
+                },
+                CredentialOrigin::ClientInfo,
+            )
             .await
             .unwrap(),
             CredentialDecision::Accept

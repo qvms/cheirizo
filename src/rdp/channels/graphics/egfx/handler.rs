@@ -82,13 +82,6 @@ impl GraphicsPipelineHandler for WrdpGraphicsHandler {
             dvc_channel_id: 0,
         }));
     }
-    fn on_capability_negotiation_failed(&mut self) {
-        tracing::warn!(
-            reason = "capability-negotiation-failed",
-            "graphics fallback selected"
-        );
-        self.publish(Some(bitmap_fallback_state(false)))
-    }
     fn on_close(&mut self) {
         tracing::warn!(
             reason = "rdpgfx-channel-closed",

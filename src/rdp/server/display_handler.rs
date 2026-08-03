@@ -1735,10 +1735,19 @@ impl DisplayChannelHandler {
                 // replay loop spins forever: is_egfx_ready()=true + needs_init=true
                 // but egfx_gate_bypassed=true prevents Planar init from executing.
                 if egfx_gate_bypassed && handler.is_egfx_ready().await {
-                    egfx_gate_bypassed = false;
-                    info!(
-                        "🔄 EGFX became ready after bypass — re-enabling EGFX path for Planar/AVC init"
-                    );
+                    if handler.negotiated_egfx_mode().await == Some(NegotiatedEgfxMode::Bitmap) {
+                        // Capability negotiation completed but selected core bitmap.
+                        // Keep the bypass latched; clearing it here causes the gate to
+                        // oscillate on every frame without ever initializing EGFX.
+                        handler
+                            .egfx_needs_init
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        egfx_gate_bypassed = false;
+                        info!(
+                            "🔄 EGFX became ready after bypass — re-enabling EGFX path for Planar/AVC init"
+                        );
+                    }
                 }
 
                 // === EGFX/H.264 PATH ===

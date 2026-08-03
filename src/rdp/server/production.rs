@@ -169,7 +169,10 @@ pub async fn run(config: Config) -> Result<()> {
         // Preserve the desktop requested during initial capability exchange.
         // Without this, a later correction emits an avoidable Deactivate-All
         // cycle before the first graphics surface is usable.
-        .with_honor_client_desktop_size(true)
+        .with_honor_client_desktop_size(Some(DesktopSize {
+            width: 1920,
+            height: 1080,
+        }))
         .with_cliprdr_factory(cliprdr_factory)
         .with_gfx_factory(gfx_factory)
         .with_sound_factory(Some(Box::new(WrdpSoundFactory::new(audio_target.clone()))))
