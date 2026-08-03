@@ -350,7 +350,11 @@ struct ProductionSesmanBinder {
 
 #[async_trait::async_trait]
 impl ConnectionBinder for ProductionSesmanBinder {
-    async fn bind_connection(&self, credentials: &Credentials) -> Result<BoundConnection> {
+    async fn bind_connection(
+        &self,
+        credentials: &Credentials,
+        desktop_size: DesktopSize,
+    ) -> Result<BoundConnection> {
         let username = normalize_local_account_name(&credentials.username);
         let active_bound_user = Arc::clone(&self.active_bound_user);
         let active_display = Arc::clone(&self.active_display);
@@ -367,7 +371,10 @@ impl ConnectionBinder for ProductionSesmanBinder {
             let manager = crate::sesman::SessionManager::new(config);
             manager.ensure(crate::sesman::EnsureOptions {
                 force_restart: false,
-                requested_size: None,
+                requested_size: Some(crate::sesman::SessionSize {
+                    width: u32::from(desktop_size.width),
+                    height: u32::from(desktop_size.height),
+                }),
                 client_peer: None,
                 client_connected: false,
             })
@@ -388,6 +395,7 @@ impl ConnectionBinder for ProductionSesmanBinder {
             clipboard_manager,
             gfx_server_handle,
             gfx_handler_state,
+            desktop_size,
         )
         .await
         {
@@ -462,6 +470,7 @@ async fn build_production_portal_generic_connection(
     clipboard_manager: Option<Arc<Mutex<ClipboardOrchestrator>>>,
     gfx_server_handle: Option<Arc<RwLock<Option<ironrdp_server::GfxServerHandle>>>>,
     gfx_handler_state: Option<Arc<RwLock<Option<crate::rdp::server::HandlerState>>>>,
+    desktop_size: DesktopSize,
 ) -> Result<(BoundConnection, Arc<DisplayChannelHandler>)> {
     #[cfg(not(feature = "portal-generic"))]
     {
@@ -473,6 +482,7 @@ async fn build_production_portal_generic_connection(
             clipboard_manager,
             gfx_server_handle,
             gfx_handler_state,
+            desktop_size,
         );
         anyhow::bail!("production wrdp requires the portal-generic feature");
     }
@@ -528,8 +538,8 @@ async fn build_production_portal_generic_connection(
 
         let display_handler = Arc::new(
             DisplayChannelHandler::new_direct(
-                initial_size.0,
-                initial_size.1,
+                desktop_size.width,
+                desktop_size.height,
                 raw_rx,
                 stream_info.clone(),
                 Some(wayland_socket.clone()),
@@ -634,12 +644,14 @@ async fn build_production_portal_generic_connection(
         Arc::clone(&display_handler).start_pipeline();
 
         info!(
-            "production wrdp attached user '{}' to {} with {} stream(s), initial={}x{}",
+            "production wrdp attached user '{}' to {} with {} stream(s), capture={}x{}, negotiated={}x{}",
             username,
             wayland_socket.display(),
             stream_info.len(),
             initial_size.0,
             initial_size.1,
+            desktop_size.width,
+            desktop_size.height,
         );
 
         let bound = BoundConnection {
