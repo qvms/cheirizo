@@ -16,6 +16,7 @@ EGFX/H.264 reduces bandwidth and can use available encoders, but negotiation, dr
 - Encoder choice depends on negotiated capabilities and runtime availability.
 - Hardware failure may replace the encoder with software H.264 during the session.
 - A failed EGFX path can fall back to bitmap updates when the connection supports them.
+- Bitmap fallback uses the client's normal local pointer; WRDP does not add a second mobile-specific pointer stream.
 - Damage and pacing decisions sit before the selected encoder.
 
 ## Alternatives considered

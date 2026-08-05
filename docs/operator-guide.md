@@ -6,7 +6,7 @@ This guide describes the first public source release. WRDP currently ships sourc
 
 WRDP targets a dedicated Linux host running systemd and Wayland dependencies. The daemon owns one managed compositor session per authenticated local user. It does not attach to an existing desktop. Two build compositions are supported:
 
-- Cargo defaults: PAM authentication, OpenH264, VA-API, Wayland and the direct portal backend.
+- Cargo defaults: PAM authentication, OpenH264, VA-API, Wayland, RDPSND and the direct portal backend.
 - Portable software: `--no-default-features --features h264,wayland,portal-generic`, using configured Argon2id credentials and software H.264.
 
 A bare `--no-default-features` build is not supported because the only production session backend requires Wayland and the graphics path requires an H.264 implementation.
@@ -21,8 +21,9 @@ cd wrdp
 make bootstrap
 make ci
 sudo install -m 0755 .local/tmp/wrdp-target/debug/{wrdp,wrdp-sesman,wrdpctl} /usr/local/bin/
-sudo install -d -m 0755 /usr/libexec/wrdp /etc/wrdp
-sudo install -m 0755 .local/tmp/wrdp-compositor-build/wrdp-compositor /usr/libexec/wrdp/
+sudo install -d -m 0755 /usr/lib/wrdp /etc/wrdp
+sudo install -m 0755 .local/tmp/wrdp-compositor-build/wrdp-compositor /usr/lib/wrdp/
+sudo make install-session-defaults
 ```
 
 Use `make build-release` and the corresponding `release/` paths for an optimized deployment. Keep the daemon and bundled compositor from the same source revision.
@@ -46,8 +47,9 @@ At minimum, review:
 - `security.auth_method` (`pam` or `password`).
 - `security.allowed_username`, if the host should accept only one account.
 - clipboard type, size and rate limits.
-- display resize and resolution limits.
-- EGFX software/hardware encoding policy.
+- display resize and resolution limits. WRDP applies the negotiated size to the managed output before capture, including on reconnect.
+- EGFX software/hardware encoding policy and `hardware_encoding.vaapi_device`.
+- `video.cursor_mode`; managed sessions normally hide the captured compositor cursor and let the RDP client render its local pointer.
 
 Validate before restart:
 
@@ -124,12 +126,13 @@ Do not set both a systemd socket and an unrelated process to the same address. W
 A package should install:
 
 - `wrdp`, `wrdp-sesman`, and `wrdpctl` in `/usr/bin` or `/usr/local/bin`.
-- the GPL-2.0-only bundled compositor as a separate executable in `/usr/libexec/wrdp`.
+- the GPL-2.0-only bundled compositor as a separate executable in `/usr/lib/wrdp`.
+- the Platinum theme in `/usr/share/themes/PlatinumTheme-wrdp-compositor` plus Labwc and Waybar defaults under `/etc/wrdp`.
 - configuration in `/etc/wrdp`, preserving local edits on upgrade.
 - systemd units in the distribution unit directory.
 - `LICENSE`, `THIRD_PARTY.md`, and the compositor GPL license.
 
-Build from `Cargo.lock` with `--locked`, the pinned Rust version in `Cargo.toml`, and the pinned IronRDP Git revision. Packages must not silently substitute another compositor or IronRDP revision.
+Build from `Cargo.lock` with `--locked`, Rust 1.94 or newer, and the pinned IronRDP Git revision. Packages must not silently substitute another compositor or IronRDP revision.
 
 ## Upgrade and rollback
 
@@ -160,9 +163,13 @@ Common failures:
 - **TLS load failure:** verify paths, PEM contents, ownership and key mode `0600`.
 - **Authentication rejected:** confirm the local account/PAM policy, `allowed_username`, and rate-limit logs.
 - **Black display with working input:** check compositor/capture logs, EGFX negotiation and whether software fallback is available; temporarily disable EGFX to isolate bitmap fallback.
-- **Hardware encoder unavailable:** verify `/dev/dri/renderD*`, VA driver packages and service permissions. WRDP falls back to software only when configured to do so.
+- **Hardware encoder unavailable:** verify `/dev/dri/renderD*`, VA driver packages and service permissions. Confirm the journal reports DMA-BUF capture and VA-API encoder creation; WRDP falls back to software only when configured to do so.
 - **Clipboard unavailable:** verify the managed compositor exposes data-control and review clipboard policy limits.
-- **Resize ignored:** check `display.allow_resize`, `allowed_resolutions`, and the maximum display area.
+- **Audio unavailable:** verify the managed user runtime has a PipeWire socket and inspect RDPSND format negotiation.
+- **Cropped desktop after reconnect:** compare the client-requested size, `wlr-randr`, capture geometry and input mapping. They must match; repeated `Cropped source frame` messages indicate a failed output resize rather than normal operation.
+- **Pointer drift or duplicate clicks:** compare RDP and stream geometry, and confirm Advanced Input became the sole mouse path. The managed capture must not embed a second cursor.
+- **Resize ignored:** check `display.allow_resize`, `allowed_resolutions`, the maximum display area and `wlr-randr` access to the managed Wayland socket.
+- **Theme missing:** verify `/etc/wrdp/labwc/rc.xml` selects `PlatinumTheme-wrdp-compositor`, the theme exists under `/usr/share/themes`, and the compositor log has no XML parser errors.
 - **Stale session:** inspect with `wrdpctl`, stop it cleanly, and verify `/run/user/UID/wrdp` ownership before reconnecting.
 
 When reporting a defect, include the exact revision, client name/version, sanitized configuration, diagnostics and relevant journal lines. Never include passwords, private keys, PAM data or clipboard contents.

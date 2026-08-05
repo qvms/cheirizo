@@ -20,8 +20,9 @@ One revision gives Cargo a coherent protocol stack and makes build results repea
 - Updating IronRDP is an explicit change with protocol and client tests.
 - Every IronRDP Git dependency points to the same commit.
 - The lockfile is committed for applications and release builds.
-- Release notes identify the IronRDP revision.
-- CI will reject branch-based IronRDP dependency specifications once the build graph is established.
+- Release notes and `THIRD_PARTY.md` identify the IronRDP revision.
+- WRDP's current IronRDP stack requires Rust 1.94 or newer.
+- CI rejects branch-based IronRDP dependency specifications.
 
 ## Alternatives considered
 

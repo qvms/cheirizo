@@ -2,7 +2,7 @@
 name = "wrdp"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.94"
 authors = ["wrdp contributors"]
 description = "single-port Wayland RDP daemon with managed per-user sessions"
 license = "MIT"

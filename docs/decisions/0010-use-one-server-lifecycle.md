@@ -21,6 +21,7 @@ One lifecycle makes supported behavior visible and keeps channel policy out of t
 - `src/rdp/server/` owns listener startup through disconnect cleanup.
 - CLI listener overrides are applied before server startup.
 - New channel or authentication features are wired in one place.
+- When Advanced Input is active, it owns mouse delivery and the overlapping core mouse path is suppressed for that connection.
 - Removed server paths do not receive compatibility shims in the new public history.
 
 ## Alternatives considered

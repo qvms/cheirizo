@@ -178,8 +178,11 @@ compositor-clean: ## Remove the vendored compositor build directory.
 	rm -rf $(COMPOSITOR_BUILD_DIR)
 
 .PHONY: install-session-defaults
-install-session-defaults: ## Install managed compositor and minimal Waybar defaults.
-	$(SUDO) install -d -m 0755 /etc/wrdp/labwc /etc/wrdp/waybar
+install-session-defaults: ## Install managed compositor, Platinum theme, and minimal Waybar defaults.
+	$(SUDO) install -d -m 0755 /etc/wrdp/labwc /etc/wrdp/waybar /usr/share/themes
+	$(SUDO) rm -rf /usr/share/themes/PlatinumTheme-wrdp-compositor
+	$(SUDO) cp -a vendor/wrdp-compositor/themes/PlatinumTheme-wrdp-compositor /usr/share/themes/
+	$(SUDO) chmod -R a+rX /usr/share/themes/PlatinumTheme-wrdp-compositor
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/labwc/autostart /etc/wrdp/labwc/autostart
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/labwc/menu.xml /etc/wrdp/labwc/menu.xml
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/labwc/rc.xml /etc/wrdp/labwc/rc.xml

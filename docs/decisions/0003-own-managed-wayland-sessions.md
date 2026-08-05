@@ -14,7 +14,8 @@ A server-owned session has clear credentials, lifecycle and resource ownership. 
 ## Consequences
 
 - The bundled compositor is part of the runtime and has its own license and notices.
-- The managed compositor provides direct frames, input and clipboard; portal and PipeWire integrations remain separate runtime paths.
+- The managed compositor provides direct frames, input and clipboard; PipeWire supplies redirected audio and remains available to portal-backed capture paths.
+- Reused sessions apply each connection's negotiated output size before capture begins.
 - Loss of the compositor ends attached RDP connections.
 - Host desktop capture is not a fallback.
 
