@@ -387,6 +387,15 @@ impl ConnectionBinder for ProductionSesmanBinder {
             .state
             .as_ref()
             .context("sesman ensure completed without persisted session state")?;
+
+        // The compositor may be reused across clients and therefore retain a
+        // previous output mode. Apply the negotiated desktop size before the
+        // capture session is created so capture, encoding, and input all share
+        // one geometry. Cropping is only a transient safety fallback.
+        resize_production_compositor(&state.xdg_runtime_dir.join("wayland-0"), desktop_size)
+            .await
+            .context("failed to apply negotiated desktop size to managed compositor")?;
+
         let (bound, display) = match build_production_portal_generic_connection(
             &username,
             state.xdg_runtime_dir.join("wayland-0"),
@@ -436,6 +445,37 @@ impl ConnectionBinder for ProductionSesmanBinder {
 
         Ok(bound)
     }
+}
+
+async fn resize_production_compositor(
+    wayland_socket: &std::path::Path,
+    size: DesktopSize,
+) -> Result<()> {
+    let runtime_dir = wayland_socket
+        .parent()
+        .context("managed compositor socket has no runtime directory")?;
+    let display = wayland_socket
+        .file_name()
+        .context("managed compositor socket has no display name")?;
+    let output = std::env::var("WRDP_HEADLESS_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".to_string());
+    let mode = format!("{}x{}", size.width, size.height);
+    let status = tokio::process::Command::new("wlr-randr")
+        .args(["--output", output.as_str(), "--custom-mode", mode.as_str()])
+        .env("XDG_RUNTIME_DIR", runtime_dir)
+        .env("WAYLAND_DISPLAY", display)
+        .status()
+        .await
+        .context("failed to execute wlr-randr")?;
+    if !status.success() {
+        anyhow::bail!("wlr-randr exited with status {status}");
+    }
+    info!(
+        width = size.width,
+        height = size.height,
+        reused_output = true,
+        "managed compositor output matches negotiated desktop"
+    );
+    Ok(())
 }
 
 fn prime_direct_frame_receiver(
@@ -562,20 +602,35 @@ async fn build_production_portal_generic_connection(
         let monitors: Vec<crate::rdp::channels::input::MonitorInfo> = stream_info
             .iter()
             .enumerate()
-            .map(|(idx, stream)| crate::rdp::channels::input::MonitorInfo {
-                id: idx as u32,
-                name: format!("{} monitor {idx}", username),
-                x: stream.position.0,
-                y: stream.position.1,
-                width: stream.size.0,
-                height: stream.size.1,
-                dpi: 96.0,
-                scale_factor: 1.0,
-                stream_x: (i64::from(stream.position.0) - i64::from(min_stream_x)) as u32,
-                stream_y: (i64::from(stream.position.1) - i64::from(min_stream_y)) as u32,
-                stream_width: stream.size.0,
-                stream_height: stream.size.1,
-                is_primary: idx == 0,
+            .map(|(idx, stream)| {
+                // Display encoding crops the capture to the negotiated desktop.
+                // Input must target that same visible crop rather than scaling
+                // coordinates into the uncropped capture dimensions.
+                let visible_width = if idx == 0 {
+                    u32::from(desktop_size.width).min(stream.size.0)
+                } else {
+                    stream.size.0
+                };
+                let visible_height = if idx == 0 {
+                    u32::from(desktop_size.height).min(stream.size.1)
+                } else {
+                    stream.size.1
+                };
+                crate::rdp::channels::input::MonitorInfo {
+                    id: idx as u32,
+                    name: format!("{} monitor {idx}", username),
+                    x: stream.position.0,
+                    y: stream.position.1,
+                    width: visible_width,
+                    height: visible_height,
+                    dpi: 96.0,
+                    scale_factor: 1.0,
+                    stream_x: (i64::from(stream.position.0) - i64::from(min_stream_x)) as u32,
+                    stream_y: (i64::from(stream.position.1) - i64::from(min_stream_y)) as u32,
+                    stream_width: visible_width,
+                    stream_height: visible_height,
+                    is_primary: idx == 0,
+                }
             })
             .collect();
 

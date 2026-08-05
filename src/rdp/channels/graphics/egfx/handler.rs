@@ -77,7 +77,10 @@ impl GraphicsPipelineHandler for WrdpGraphicsHandler {
             is_avc420_enabled: avc420,
             is_avc444_enabled: avc444,
             requires_core_reset: false,
-            needs_android_pointer_updates: mode == NegotiatedEgfxMode::Bitmap,
+            // Modern Microsoft mobile clients render their own local pointer.
+            // Sending an additional server bitmap/position stream produces a
+            // duplicate cursor and a hotspot that diverges from injected input.
+            needs_android_pointer_updates: false,
             primary_surface_id: None,
             dvc_channel_id: 0,
         }));
@@ -156,7 +159,7 @@ fn bitmap_fallback_state(requires_core_reset: bool) -> HandlerState {
         is_ready: true,
         negotiated_mode: Some(NegotiatedEgfxMode::Bitmap),
         requires_core_reset,
-        needs_android_pointer_updates: true,
+        needs_android_pointer_updates: false,
         ..HandlerState::default()
     }
 }
@@ -216,6 +219,7 @@ mod tests {
         assert!(!state.is_avc420_enabled);
         assert!(!state.is_avc444_enabled);
         assert!(!state.requires_core_reset);
+        assert!(!state.needs_android_pointer_updates);
         assert!(bitmap_fallback_state(true).requires_core_reset);
     }
 

@@ -415,7 +415,8 @@ mod tests {
     fn test_button_press_release() {
         let mut handler = MouseHandler::new();
 
-        // Press left button
+        // Press left button through the same transition gate used in production.
+        assert!(handler.accept_button_transition(MouseButton::Left, true));
         let event = handler.handle_button_down(MouseButton::Left).unwrap();
         match event {
             MouseEvent::ButtonDown { button, .. } => {
@@ -426,7 +427,8 @@ mod tests {
 
         assert!(handler.is_button_pressed(MouseButton::Left));
 
-        // Release left button
+        // Release left button through the same transition gate used in production.
+        assert!(handler.accept_button_transition(MouseButton::Left, false));
         let event = handler.handle_button_up(MouseButton::Left).unwrap();
         match event {
             MouseEvent::ButtonUp { button, .. } => {
@@ -510,13 +512,16 @@ mod tests {
     fn test_multiple_button_states() {
         let mut handler = MouseHandler::new();
 
+        assert!(handler.accept_button_transition(MouseButton::Left, true));
         handler.handle_button_down(MouseButton::Left).unwrap();
+        assert!(handler.accept_button_transition(MouseButton::Right, true));
         handler.handle_button_down(MouseButton::Right).unwrap();
 
         assert!(handler.is_button_pressed(MouseButton::Left));
         assert!(handler.is_button_pressed(MouseButton::Right));
         assert!(!handler.is_button_pressed(MouseButton::Middle));
 
+        assert!(handler.accept_button_transition(MouseButton::Left, false));
         handler.handle_button_up(MouseButton::Left).unwrap();
 
         assert!(!handler.is_button_pressed(MouseButton::Left));
@@ -527,7 +532,9 @@ mod tests {
     fn test_mouse_reset() {
         let mut handler = MouseHandler::new();
 
+        assert!(handler.accept_button_transition(MouseButton::Left, true));
         handler.handle_button_down(MouseButton::Left).unwrap();
+        assert!(handler.accept_button_transition(MouseButton::Right, true));
         handler.handle_button_down(MouseButton::Right).unwrap();
         handler.scroll_accum_x = 5.0;
         handler.scroll_accum_y = 5.0;
