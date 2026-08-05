@@ -1,6 +1,6 @@
 # WRDP
 
-WRDP is a single-port RDP server for Linux desktops running Wayland.
+WRDP is a single-port, multi-user RDP server for Linux servers running Wayland in headless mode.
 
 It accepts an RDP connection, authenticates the user, starts or reuses that user’s managed compositor session, and sends display, input and clipboard data through IronRDP.
 
