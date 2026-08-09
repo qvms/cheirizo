@@ -119,6 +119,10 @@ Type=simple
 ExecStart=/usr/local/bin/wrdp --config /etc/wrdp/wrdp.ini
 Restart=on-failure
 RestartSec=2s
+RuntimeDirectory=wrdp
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/wrdp /run/user
 LimitNOFILE=65536
 
 [Install]
@@ -133,7 +137,7 @@ sudo systemctl enable --now wrdp.socket
 sudo systemctl status wrdp.socket wrdp.service
 ```
 
-Do not set both a systemd socket and an unrelated process to the same address. WRDP requires the activated descriptor to be a listening TCP socket whose complete address and IP family exactly match `server.listen_addr`; mismatch is a startup error.
+Do not set both a systemd socket and an unrelated process to the same address. WRDP requires the activated descriptor to be a listening TCP socket whose complete address and IP family exactly match `server.listen_addr`; mismatch is a startup error. Keep `RuntimeDirectoryPreserve=yes`: trusted session state must survive a daemon restart so startup reconciliation can authenticate or retire managed processes safely.
 
 ## Packaging contract
 
