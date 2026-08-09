@@ -1,0 +1,72 @@
+---
+# Trusted administrator input. Run from the repository root with
+# WRDP_SOURCE_DIR set to that absolute path.
+packages:
+  - adwaita-icon-theme
+  - dbus-daemon
+  - foot
+  - util-linux
+  - fuzzel
+  - gvfs
+  - gvfs-backends
+  - libnotify-bin
+  - mako-notifier
+  - python3-yaml
+  - swaybg
+  - thunar
+  - tumbler
+  - waybar
+  - xdg-user-dirs
+
+directories:
+  - path: /etc/wrdp/labwc
+    permissions: "0755"
+  - path: /etc/wrdp/waybar
+    permissions: "0755"
+  - path: /etc/wrdp/mako
+    permissions: "0755"
+  - path: /etc/wrdp/wallpaper
+    permissions: "0755"
+  - path: /usr/lib/wrdp
+    permissions: "0755"
+  - path: /usr/share/themes
+    permissions: "0755"
+
+copy_files:
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/labwc/autostart
+    destination: /etc/wrdp/labwc/autostart
+    permissions: "0644"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/labwc/menu.xml
+    destination: /etc/wrdp/labwc/menu.xml
+    permissions: "0644"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/labwc/rc.xml
+    destination: /etc/wrdp/labwc/rc.xml
+    permissions: "0644"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/labwc/shutdown
+    destination: /etc/wrdp/labwc/shutdown
+    permissions: "0755"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/waybar/config.jsonc
+    destination: /etc/wrdp/waybar/config.jsonc
+    permissions: "0644"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/waybar/style.css
+    destination: /etc/wrdp/waybar/style.css
+    permissions: "0644"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/mako/config
+    destination: /etc/wrdp/mako/config
+    permissions: "0644"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/wallpaper/wallpaper.conf
+    destination: /etc/wrdp/wallpaper/wallpaper.conf
+    permissions: "0644"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/bin/wrdp-desktop-action
+    destination: /usr/lib/wrdp/wrdp-desktop-action
+    permissions: "0755"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/bin/wrdp-desktop-session
+    destination: /usr/lib/wrdp/wrdp-desktop-session
+    permissions: "0755"
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/contrib/wrdp/bin/wrdp-wallpaper
+    destination: /usr/lib/wrdp/wrdp-wallpaper
+    permissions: "0755"
+
+copy_trees:
+  - source: ${WRDP_SOURCE_DIR}/vendor/wrdp-compositor/themes/PlatinumTheme-wrdp-compositor
+    destination: /usr/share/themes/PlatinumTheme-wrdp-compositor

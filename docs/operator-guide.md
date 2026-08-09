@@ -1,6 +1,6 @@
 # WRDP operator guide
 
-This guide describes the first public source release. WRDP currently ships source and a bundled compositor; distribution packages are not yet published.
+This guide describes the first public source release. WRDP currently ships source and a bundled compositor; distribution packages are not yet published. The optional [minimal Platinum desktop](minimal-desktop.md) documents the Waybar, Thunar, Mako and two-pass ground-init profile.
 
 ## Supported deployment
 
@@ -24,6 +24,13 @@ sudo install -m 0755 .local/tmp/wrdp-target/debug/{wrdp,wrdp-sesman,wrdpctl} /us
 sudo install -d -m 0755 /usr/lib/wrdp /etc/wrdp
 sudo install -m 0755 .local/tmp/wrdp-compositor-build/wrdp-compositor /usr/lib/wrdp/
 sudo make install-session-defaults
+```
+
+For a complete minimal desktop, including packages and per-user preferences, use the two provisioning passes instead:
+
+```sh
+sudo make provision-system
+sudo make provision-user PROVISION_USER="$USER"
 ```
 
 Use `make build-release` and the corresponding `release/` paths for an optimized deployment. Keep the daemon and bundled compositor from the same source revision.

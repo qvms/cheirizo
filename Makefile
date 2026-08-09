@@ -33,6 +33,10 @@ MESON ?= meson
 DOCKER ?= docker
 APT_GET ?= apt-get
 SUDO ?= $(shell if [ "$$(id -u)" = 0 ]; then printf ""; else printf "sudo"; fi)
+PYTHON := /usr/bin/python3
+WRDP_SOURCE_DIR := $(abspath .)
+PROVISION_USER ?=
+export WRDP_SOURCE_DIR PROVISION_USER
 
 CARGO_ENV := TMPDIR=$(WRDP_TMPDIR) CARGO_TARGET_DIR=$(CARGO_TARGET_DIR)
 CARGO_COMMON := --features $(FEATURES)
@@ -69,12 +73,14 @@ APT_PACKAGES := \
 	libssl-dev \
 	libva-dev \
 	libwayland-dev \
-	libwlroots-dev \
+	libwlroots-0.18-dev \
+	libxml2-dev \
 	libxcb-icccm4-dev \
 	libxcb1-dev \
 	libxkbcommon-dev \
 	meson \
 	nasm \
+	wayland-protocols \
 	ninja-build \
 	pkgconf \
 	ripgrep
@@ -178,16 +184,33 @@ compositor-clean: ## Remove the vendored compositor build directory.
 	rm -rf $(COMPOSITOR_BUILD_DIR)
 
 .PHONY: install-session-defaults
-install-session-defaults: ## Install managed compositor, Platinum theme, and minimal Waybar defaults.
-	$(SUDO) install -d -m 0755 /etc/wrdp/labwc /etc/wrdp/waybar /usr/share/themes
+install-session-defaults: ## Install the minimal managed desktop configuration and Platinum theme.
+	$(SUDO) install -d -m 0755 /etc/wrdp/labwc /etc/wrdp/waybar /etc/wrdp/mako /etc/wrdp/wallpaper /usr/lib/wrdp /usr/share/themes
 	$(SUDO) rm -rf /usr/share/themes/PlatinumTheme-wrdp-compositor
 	$(SUDO) cp -a vendor/wrdp-compositor/themes/PlatinumTheme-wrdp-compositor /usr/share/themes/
 	$(SUDO) chmod -R a+rX /usr/share/themes/PlatinumTheme-wrdp-compositor
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/labwc/autostart /etc/wrdp/labwc/autostart
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/labwc/menu.xml /etc/wrdp/labwc/menu.xml
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/labwc/rc.xml /etc/wrdp/labwc/rc.xml
+	$(SUDO) install -m 0755 vendor/wrdp-compositor/contrib/wrdp/labwc/shutdown /etc/wrdp/labwc/shutdown
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/waybar/config.jsonc /etc/wrdp/waybar/config.jsonc
 	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/waybar/style.css /etc/wrdp/waybar/style.css
+	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/mako/config /etc/wrdp/mako/config
+	$(SUDO) install -m 0644 vendor/wrdp-compositor/contrib/wrdp/wallpaper/wallpaper.conf /etc/wrdp/wallpaper/wallpaper.conf
+	$(SUDO) install -m 0755 vendor/wrdp-compositor/contrib/wrdp/bin/wrdp-desktop-action /usr/lib/wrdp/wrdp-desktop-action
+	$(SUDO) install -m 0755 vendor/wrdp-compositor/contrib/wrdp/bin/wrdp-desktop-session /usr/lib/wrdp/wrdp-desktop-session
+	$(SUDO) install -m 0755 vendor/wrdp-compositor/contrib/wrdp/bin/wrdp-wallpaper /usr/lib/wrdp/wrdp-wallpaper
+
+.PHONY: provision-system
+provision-system: ## Provision packages and system-owned desktop files (run as root).
+	@test "$$(id -u)" -eq 0 || { echo "provision-system must run as root" >&2; exit 1; }
+	@$(PYTHON) -c 'import yaml' >/dev/null 2>&1 || { apt-get update && apt-get install -y python3-yaml; }
+	$(PYTHON) vendor/ground-init/ground-init.py ground-init.system.yaml
+
+.PHONY: provision-user
+provision-user: ## Provision one user's preferences (PROVISION_USER=name; run as root).
+	@test "$$(id -u)" -eq 0 || { echo "provision-user must run as root" >&2; exit 1; }
+	@$(PYTHON) scripts/provision-user.py
 
 .PHONY: validate-production
 validate-production: metadata fmt ## Run release-oriented Rust and compositor gates.

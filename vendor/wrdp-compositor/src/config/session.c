@@ -30,6 +30,7 @@ static const char *const env_vars[] = {
 	"XCURSOR_THEME",
 	"XDG_SESSION_TYPE",
 	"WRDP_COMPOSITOR_PID",
+	"WRDP_COMPOSITOR_START_TICKS",
 	"WRDP_COMPOSITOR_VER",
 	NULL
 };

@@ -1,0 +1,10 @@
+#!/bin/sh
+# Record this compositor generation as stopped, then terminate its authenticated
+# desktop supervisor process group. A delayed autostart for this generation will
+# observe the stop token and refuse to start.
+case "${WRDP_COMPOSITOR_PID:-}:${WRDP_COMPOSITOR_START_TICKS:-}" in
+    *[!0-9:]*|:|*:) exit 0 ;;
+    *) exec /usr/lib/wrdp/wrdp-desktop-session --stop \
+        --compositor-pid "$WRDP_COMPOSITOR_PID" \
+        --compositor-start-ticks "$WRDP_COMPOSITOR_START_TICKS" ;;
+esac

@@ -1,0 +1,233 @@
+#!/bin/bash
+set -euo pipefail
+
+runtime=${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}
+expected="/run/user/$(id -u)/wrdp"
+[[ "$runtime" == "$expected" ]] || {
+    printf 'refusing unexpected WRDP runtime: %s\n' "$runtime" >&2
+    exit 2
+}
+[[ ! -L "$runtime" && $(stat -c %u "$runtime") == $(id -u) ]] || {
+    printf 'refusing unsafe WRDP runtime ownership\n' >&2
+    exit 2
+}
+
+lock="$runtime/desktop-session.lock"
+bus_file="$runtime/desktop-session.bus"
+state_file="$runtime/desktop-session.state"
+stop_file="$runtime/desktop-session.stop"
+start_ticks() {
+    local stat rest
+    IFS= read -r stat < "/proc/$1/stat" || return 1
+    rest=${stat##*) }
+    set -- $rest
+    printf '%s\n' "${20}"
+}
+atomic_write() {
+    local destination=$1 value=$2 temporary
+    temporary=$(mktemp "$runtime/.desktop-session.XXXXXX")
+    chmod 0600 "$temporary"
+    printf '%s\n' "$value" > "$temporary"
+    mv -f "$temporary" "$destination"
+}
+valid_compositor() {
+    local pid=$1 ticks=$2
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && "$ticks" =~ ^[0-9]+$ ]] || return 1
+    [[ -d "/proc/$pid" && $(stat -c %u "/proc/$pid") == $(id -u) ]] || return 1
+    [[ $(cat "/proc/$pid/comm") == wrdp-compositor ]] || return 1
+    [[ $(start_ticks "$pid") == "$ticks" ]] || return 1
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -Fqx "XDG_RUNTIME_DIR=$runtime"
+}
+valid_supervisor() {
+    local pid=$1 ticks=$2
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && "$ticks" =~ ^[0-9]+$ ]] || return 1
+    [[ -d "/proc/$pid" && $(stat -c %u "/proc/$pid") == $(id -u) ]] || return 1
+    [[ $(cat "/proc/$pid/comm") == wrdp-desktop-se ]] || return 1
+    [[ $(start_ticks "$pid") == "$ticks" ]] || return 1
+    [[ $(ps -o pgid= -p "$pid" | tr -d ' ') == "$pid" ]]
+}
+process_group_alive() {
+    kill -0 -- "-$1" 2>/dev/null
+}
+read_safe_file() {
+    local path=$1
+    [[ -f "$path" && ! -L "$path" ]] || return 1
+    [[ $(stat -c %u "$path") == $(id -u) && $(stat -c %a "$path") == 600 ]] || return 1
+    cat "$path"
+}
+remove_generation_state() {
+    local expected=$1 state supervisor_pid supervisor_ticks state_compositor_pid state_compositor_ticks
+    # Shutdown may own the lock while terminating this process group. In that
+    # case it is also responsible for generation-checked state removal.
+    flock -n 9 || return 0
+    if state=$(read_safe_file "$state_file" 2>/dev/null); then
+        read -r supervisor_pid supervisor_ticks state_compositor_pid state_compositor_ticks <<<"$state"
+        if [[ "$state_compositor_pid $state_compositor_ticks" == "$expected" ]]; then
+            rm -f "$state_file" "$bus_file"
+        fi
+    fi
+    flock -u 9
+}
+
+mode=start
+if [[ ${1:-} == --stop ]]; then
+    mode=stop
+    shift
+fi
+[[ $# == 4 && $1 == --compositor-pid && $3 == --compositor-start-ticks ]] || {
+    printf 'usage: %s [--stop] --compositor-pid PID --compositor-start-ticks TICKS\n' "$0" >&2
+    exit 2
+}
+compositor_pid=$2
+compositor_ticks=$4
+[[ "$compositor_pid" =~ ^[0-9]+$ && "$compositor_pid" -gt 1 &&
+    "$compositor_ticks" =~ ^[0-9]+$ ]] || exit 2
+compositor_token="$compositor_pid $compositor_ticks"
+
+exec 9>"$lock"
+chmod 0600 "$lock"
+flock 9
+
+if [[ "$mode" == stop ]]; then
+    supervisor_pid=""
+    supervisor_ticks=""
+    state_compositor_pid=""
+    state_compositor_ticks=""
+    atomic_write "$stop_file" "$compositor_token"
+    if state=$(read_safe_file "$state_file" 2>/dev/null); then
+        read -r supervisor_pid supervisor_ticks state_compositor_pid state_compositor_ticks <<<"$state"
+    fi
+    if [[ "$state_compositor_pid $state_compositor_ticks" != "$compositor_token" ]] ||
+        ! valid_supervisor "$supervisor_pid" "$supervisor_ticks"; then
+        supervisor_pid=""
+    fi
+    if [[ -n "$supervisor_pid" ]]; then
+        kill -TERM -- "-$supervisor_pid" 2>/dev/null || true
+        for _ in {1..20}; do
+            process_group_alive "$supervisor_pid" || break
+            sleep 0.1
+        done
+        if process_group_alive "$supervisor_pid"; then
+            kill -KILL -- "-$supervisor_pid" 2>/dev/null || true
+            for _ in {1..20}; do
+                process_group_alive "$supervisor_pid" || break
+                sleep 0.05
+            done
+        fi
+        process_group_alive "$supervisor_pid" && {
+            printf 'desktop process group did not terminate\n' >&2
+            flock -u 9
+            exit 1
+        }
+    fi
+    if [[ "$state_compositor_pid $state_compositor_ticks" == "$compositor_token" ]]; then
+        rm -f "$state_file" "$bus_file"
+    fi
+    flock -u 9
+    exit 0
+fi
+
+valid_compositor "$compositor_pid" "$compositor_ticks" || {
+    flock -u 9
+    printf 'refusing invalid compositor identity\n' >&2
+    exit 2
+}
+
+# A shutdown that won the start/stop race blocks this compositor generation.
+if stopped=$(read_safe_file "$stop_file" 2>/dev/null); then
+    if [[ "$stopped" == "$compositor_token" ]]; then
+        flock -u 9
+        printf 'desktop startup cancelled by compositor shutdown\n' >&2
+        exit 0
+    fi
+    rm -f "$stop_file"
+fi
+
+# A duplicate autostart for the same live supervisor is harmless.
+if state=$(read_safe_file "$state_file" 2>/dev/null); then
+    read -r existing_pid existing_ticks state_compositor_pid state_compositor_ticks <<<"$state"
+    if [[ "$state_compositor_pid $state_compositor_ticks" == "$compositor_token" ]] &&
+        valid_supervisor "$existing_pid" "$existing_ticks"; then
+        flock -u 9
+        printf 'WRDP desktop session is already running\n' >&2
+        exit 0
+    fi
+    rm -f "$state_file" "$bus_file"
+fi
+
+[[ $$ == $(ps -o pgid= -p $$ | tr -d ' ') ]] || {
+    flock -u 9
+    printf 'desktop supervisor must be a process-group leader\n' >&2
+    exit 2
+}
+own_state="$$ $(start_ticks $$) $compositor_token"
+atomic_write "$state_file" "$own_state"
+flock -u 9
+
+session_pid=""
+watchdog_pid=""
+cleanup() {
+    trap - EXIT HUP INT TERM
+    if [[ -n "$watchdog_pid" ]]; then
+        kill "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$session_pid" ]]; then
+        kill "$session_pid" 2>/dev/null || true
+        wait "$session_pid" 2>/dev/null || true
+    fi
+    remove_generation_state "$compositor_token"
+}
+trap cleanup EXIT HUP INT TERM
+
+(
+    while valid_compositor "$compositor_pid" "$compositor_ticks"; do
+        sleep 0.2
+    done
+    kill -TERM -- "-$$" 2>/dev/null || true
+) &
+watchdog_pid=$!
+
+dbus-run-session -- bash -euo pipefail -c '
+    children=()
+    bus_file="$XDG_RUNTIME_DIR/desktop-session.bus"
+    case "$DBUS_SESSION_BUS_ADDRESS" in
+        unix:path=*|unix:abstract=*) ;;
+        *) printf "unexpected D-Bus address\n" >&2; exit 2 ;;
+    esac
+    temporary=$(mktemp "$XDG_RUNTIME_DIR/.desktop-session-bus.XXXXXX")
+    chmod 0600 "$temporary"
+    printf "%s\n" "$DBUS_SESSION_BUS_ADDRESS" > "$temporary"
+    mv -f "$temporary" "$bus_file"
+    stop() {
+        trap - EXIT HUP INT TERM
+        if ((${#children[@]})); then
+            kill "${children[@]}" 2>/dev/null || true
+            wait "${children[@]}" 2>/dev/null || true
+        fi
+    }
+    trap stop EXIT HUP INT TERM
+
+    if command -v swaybg >/dev/null 2>&1; then
+        /usr/lib/wrdp/wrdp-wallpaper & children+=("$!")
+    fi
+    if command -v mako >/dev/null 2>&1; then
+        mako --config /etc/wrdp/mako/config & children+=("$!")
+    fi
+    if command -v waybar >/dev/null 2>&1; then
+        waybar --config /etc/wrdp/waybar/config.jsonc --style /etc/wrdp/waybar/style.css & children+=("$!")
+    fi
+
+    ((${#children[@]})) || exit 0
+    wait -n "${children[@]}"
+' &
+session_pid=$!
+set +e
+wait "$session_pid"
+status=$?
+set -e
+session_pid=""
+kill "$watchdog_pid" 2>/dev/null || true
+wait "$watchdog_pid" 2>/dev/null || true
+watchdog_pid=""
+exit "$status"

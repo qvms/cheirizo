@@ -1,0 +1,73 @@
+---
+# Run as the target user with HOME set to that account's home directory.
+directories:
+  - path: ${HOME}/Desktop
+    permissions: "0755"
+  - path: ${HOME}/Documents
+    permissions: "0755"
+  - path: ${HOME}/Downloads
+    permissions: "0755"
+  - path: ${HOME}/Pictures
+    permissions: "0755"
+  - path: ${HOME}/.cache/wrdp/wallpapers
+    permissions: "0700"
+  - path: ${HOME}/.config/gtk-3.0
+    permissions: "0700"
+  - path: ${HOME}/.config/gtk-4.0
+    permissions: "0700"
+  - path: ${HOME}/.config/wrdp
+    permissions: "0700"
+
+write_files:
+  - path: ${HOME}/.config/gtk-3.0/settings.ini
+    permissions: "0644"
+    content: |
+      [Settings]
+      gtk-font-name=Charcoal 11
+      gtk-icon-theme-name=Adwaita
+      gtk-decoration-layout=close:minimize,maximize
+      gtk-enable-animations=false
+  - path: ${HOME}/.config/gtk-4.0/settings.ini
+    permissions: "0644"
+    content: |
+      [Settings]
+      gtk-font-name=Charcoal 11
+      gtk-icon-theme-name=Adwaita
+      gtk-decoration-layout=close:minimize,maximize
+      gtk-enable-animations=false
+  - path: ${HOME}/.config/mimeapps.list
+    permissions: "0644"
+    content: |
+      [Default Applications]
+      inode/directory=thunar.desktop
+      application/x-directory=thunar.desktop
+  - path: ${HOME}/.config/user-dirs.dirs
+    permissions: "0644"
+    content: |
+      XDG_DESKTOP_DIR="$HOME/Desktop"
+      XDG_DOWNLOAD_DIR="$HOME/Downloads"
+      XDG_DOCUMENTS_DIR="$HOME/Documents"
+      XDG_MUSIC_DIR="$HOME"
+      XDG_PICTURES_DIR="$HOME/Pictures"
+      XDG_PUBLICSHARE_DIR="$HOME"
+      XDG_TEMPLATES_DIR="$HOME"
+      XDG_VIDEOS_DIR="$HOME"
+  - path: ${HOME}/.config/user-dirs.locale
+    permissions: "0644"
+    content: |
+      en_US
+  - path: ${HOME}/.config/gtk-3.0/bookmarks
+    permissions: "0644"
+    content: |
+      file://${HOME}/Desktop Desktop
+      file://${HOME}/Documents Documents
+      file://${HOME}/Downloads Downloads
+  - path: ${HOME}/.config/wrdp/wallpaper.conf
+    permissions: "0644"
+    content: |
+      mode=solid
+      color=#bdbab4
+  - path: ${HOME}/.config/wrdp/provisioned-v1
+    permissions: "0644"
+    content: |
+      minimal-platinum-desktop-v1

@@ -1,0 +1,113 @@
+#!/bin/sh
+set -eu
+
+import_session_bus() {
+    runtime=${XDG_RUNTIME_DIR:-}
+    expected="/run/user/$(id -u)/wrdp"
+    [ "$runtime" = "$expected" ] || return 0
+    bus_file="$runtime/desktop-session.bus"
+    [ -f "$bus_file" ] && [ ! -L "$bus_file" ] || return 0
+    [ "$(stat -c %u "$bus_file" 2>/dev/null || printf invalid)" = "$(id -u)" ] &&
+        [ "$(stat -c %a "$bus_file" 2>/dev/null || printf invalid)" = 600 ] || {
+        printf 'refusing unsafe desktop session bus file\n' >&2
+        return 2
+    }
+    IFS= read -r address < "$bus_file" || return 0
+    case "$address" in
+        unix:path=*|unix:abstract=*) ;;
+        *) printf 'refusing invalid desktop session bus address\n' >&2; return 2 ;;
+    esac
+    if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ "$DBUS_SESSION_BUS_ADDRESS" != "$address" ]; then
+        printf 'refusing mismatched desktop session bus address\n' >&2
+        return 2
+    fi
+    DBUS_SESSION_BUS_ADDRESS=$address
+    export DBUS_SESSION_BUS_ADDRESS
+}
+
+valid_compositor_pid() {
+    pid=$1
+    runtime=$2
+    case "$pid" in *[!0-9]*|'') return 1 ;; esac
+    [ "$pid" -gt 1 ] && [ -d "/proc/$pid" ] || return 1
+    [ "$(cat "/proc/$pid/comm" 2>/dev/null || true)" = wrdp-compositor ] || return 1
+    [ "$(stat -c %u "/proc/$pid" 2>/dev/null || printf invalid)" = "$(id -u)" ] || return 1
+    tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -Fqx "XDG_RUNTIME_DIR=$runtime"
+}
+
+resolve_compositor_pid() {
+    runtime=${XDG_RUNTIME_DIR:-}
+    [ "$runtime" = "/run/user/$(id -u)/wrdp" ] || {
+        printf 'cannot resolve compositor outside the WRDP runtime\n' >&2
+        return 2
+    }
+    if [ -n "${WRDP_COMPOSITOR_PID:-}" ]; then
+        valid_compositor_pid "$WRDP_COMPOSITOR_PID" "$runtime" || {
+            printf 'refusing invalid compositor PID\n' >&2
+            return 2
+        }
+        export WRDP_COMPOSITOR_PID
+        return 0
+    fi
+    matches=""
+    for process in /proc/[0-9]*; do
+        valid_compositor_pid "${process##*/}" "$runtime" || continue
+        matches="$matches ${process##*/}"
+    done
+    set -- $matches
+    [ "$#" -eq 1 ] || {
+        printf 'expected one compositor in this WRDP runtime, found %s\n' "$#" >&2
+        return 2
+    }
+    WRDP_COMPOSITOR_PID=$1
+    export WRDP_COMPOSITOR_PID
+}
+
+run_detached() {
+    "$@" >/dev/null 2>&1 &
+}
+
+choose() {
+    prompt=$1
+    shift
+    printf '%s\n' "$@" | fuzzel --dmenu --prompt="${prompt}> " --lines="${#}"
+}
+
+import_session_bus
+
+action=${1:-launcher}
+case "$action" in
+    launcher)
+        selection=$(choose WRDP "Files" "Terminal" "Applications" "Reconfigure" "Disconnect") || exit 0
+        case "$selection" in
+            Files) action=files ;;
+            Terminal) action=terminal ;;
+            Applications) action=applications ;;
+            Reconfigure) action=reconfigure ;;
+            Disconnect) action=disconnect ;;
+            *) exit 0 ;;
+        esac
+        ;;
+    session)
+        selection=$(choose Session "Reconfigure" "Disconnect") || exit 0
+        case "$selection" in
+            Reconfigure) action=reconfigure ;;
+            Disconnect) action=disconnect ;;
+            *) exit 0 ;;
+        esac
+        ;;
+    files|terminal|applications|reconfigure|disconnect)
+        ;;
+    *)
+        printf 'unsupported desktop action: %s\n' "$action" >&2
+        exit 2
+        ;;
+esac
+
+case "$action" in
+    files) run_detached thunar ;;
+    terminal) run_detached foot ;;
+    applications) run_detached fuzzel ;;
+    reconfigure) resolve_compositor_pid; /usr/lib/wrdp/wrdp-compositor --reconfigure ;;
+    disconnect) resolve_compositor_pid; /usr/lib/wrdp/wrdp-compositor --exit ;;
+esac

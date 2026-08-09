@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* WRDP modifications, 2026. */
 #define _POSIX_C_SOURCE 200809L
+#include <errno.h>
 #include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include "common/dir.h"
@@ -63,6 +66,45 @@ die_on_detecting_suid(void)
 	}
 	wlr_log(WLR_ERROR, "SUID detected - aborting");
 	exit(EXIT_FAILURE);
+}
+
+static bool
+read_self_start_ticks(char *buffer, size_t size)
+{
+	FILE *stream = fopen("/proc/self/stat", "r");
+	if (!stream) {
+		return false;
+	}
+	char *line = NULL;
+	size_t capacity = 0;
+	bool success = false;
+	if (getline(&line, &capacity, stream) < 0) {
+		goto out;
+	}
+	char *after_comm = strrchr(line, ')');
+	if (!after_comm || after_comm[1] != ' ') {
+		goto out;
+	}
+	char *saveptr = NULL;
+	char *token = strtok_r(after_comm + 2, " ", &saveptr);
+	for (int field = 3; token; field++, token = strtok_r(NULL, " ", &saveptr)) {
+		if (field != 22) {
+			continue;
+		}
+		errno = 0;
+		char *end = NULL;
+		unsigned long long ticks = strtoull(token, &end, 10);
+		if (errno != 0 || end == token || (*end != '\0' && *end != '\n')) {
+			goto out;
+		}
+		int written = snprintf(buffer, size, "%llu", ticks);
+		success = written > 0 && (size_t)written < size;
+		break;
+	}
+out:
+	free(line);
+	fclose(stream);
+	return success;
 }
 
 static void
@@ -188,9 +230,20 @@ main(int argc, char *argv[])
 	snprintf(pid, sizeof(pid), "%d", getpid());
 	if (setenv("WRDP_COMPOSITOR_PID", pid, true) < 0) {
 		wlr_log_errno(WLR_ERROR, "unable to set WRDP_COMPOSITOR_PID");
-	} else {
-		wlr_log(WLR_DEBUG, "WRDP_COMPOSITOR_PID=%s", pid);
+		exit(EXIT_FAILURE);
 	}
+	wlr_log(WLR_DEBUG, "WRDP_COMPOSITOR_PID=%s", pid);
+
+	char start_ticks[32];
+	if (!read_self_start_ticks(start_ticks, sizeof(start_ticks))) {
+		wlr_log(WLR_ERROR, "unable to read compositor kernel start ticks");
+		exit(EXIT_FAILURE);
+	}
+	if (setenv("WRDP_COMPOSITOR_START_TICKS", start_ticks, true) < 0) {
+		wlr_log_errno(WLR_ERROR, "unable to set WRDP_COMPOSITOR_START_TICKS");
+		exit(EXIT_FAILURE);
+	}
+	wlr_log(WLR_DEBUG, "WRDP_COMPOSITOR_START_TICKS=%s", start_ticks);
 
 	/* useful for helper programs */
 	if (setenv("WRDP_COMPOSITOR_VER", WRDP_COMPOSITOR_VERSION, true) < 0) {

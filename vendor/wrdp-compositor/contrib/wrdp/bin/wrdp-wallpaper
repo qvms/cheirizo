@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Select WRDP's offline wallpaper or refresh a cached Bing image."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import tempfile
+import urllib.parse
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+SYSTEM_CONFIG = Path("/etc/wrdp/wallpaper/wallpaper.conf")
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+BING_ENDPOINT = "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=en-US"
+
+
+def read_config(home: Path) -> dict[str, str]:
+    config = {"mode": "solid", "color": "#bdbab4"}
+    for path in (SYSTEM_CONFIG, home / ".config/wrdp/wallpaper.conf"):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key in {"mode", "color"}:
+                config[key] = value.strip()
+    return config
+
+
+def safe_bing_url(metadata: dict) -> str:
+    images = metadata.get("images")
+    if not isinstance(images, list) or not images or not isinstance(images[0], dict):
+        raise ValueError("Bing response contains no image")
+    path = images[0].get("url")
+    if not isinstance(path, str):
+        raise ValueError("Bing image URL is missing")
+    url = urllib.parse.urljoin("https://www.bing.com/", path)
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in {"www.bing.com", "bing.com"}:
+        raise ValueError("Bing image URL is not an approved HTTPS host")
+    return url
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        raise ValueError(f"redirect refused: {code} {new_url}")
+
+
+def approved_https_url(url: str) -> bool:
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme == "https" and parsed.hostname in {"www.bing.com", "bing.com"}
+
+
+def fetch_limited(url: str, expected: str | None = None) -> bytes:
+    if not approved_https_url(url):
+        raise ValueError("download URL is not an approved Bing HTTPS host")
+    request = urllib.request.Request(url, headers={"User-Agent": "wrdp-wallpaper/1"})
+    opener = urllib.request.build_opener(NoRedirect)
+    with opener.open(request, timeout=15) as response:
+        if not approved_https_url(response.geturl()):
+            raise ValueError("final download URL is not an approved Bing HTTPS host")
+        content_type = response.headers.get_content_type()
+        if expected == "json" and content_type not in {"application/json", "text/json"}:
+            raise ValueError(f"unexpected metadata content type: {content_type}")
+        if expected == "image" and content_type not in {
+            "image/jpeg",
+            "image/png",
+            "image/webp",
+        }:
+            raise ValueError(f"unexpected image content type: {content_type}")
+        data = response.read(MAX_IMAGE_BYTES + 1)
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ValueError("Bing image exceeds 20 MiB")
+    if expected == "image" and not (
+        data.startswith(b"\xff\xd8\xff")
+        or data.startswith(b"\x89PNG\r\n\x1a\n")
+        or (len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+    ):
+        raise ValueError("download is not a supported JPEG, PNG or WebP image")
+    return data
+
+
+def refresh_bing(home: Path) -> Path:
+    metadata = json.loads(fetch_limited(BING_ENDPOINT, "json"))
+    image = fetch_limited(safe_bing_url(metadata), "image")
+    directory = home / ".cache/wrdp/wallpapers"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=directory, prefix="bing-", suffix=".tmp", delete=False
+        ) as handle:
+            handle.write(image)
+            temporary = Path(handle.name)
+        destination = directory / "bing-current.jpg"
+        os.replace(temporary, destination)
+        temporary = None
+        destination.chmod(0o600)
+        return destination
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def swaybg_command(home: Path, config: dict[str, str]) -> list[str]:
+    cached = home / ".cache/wrdp/wallpapers/bing-current.jpg"
+    if config.get("mode") == "bing" and cached.is_file():
+        return ["swaybg", "-i", str(cached), "-m", "fill"]
+    color = config.get("color", "#bdbab4")
+    if not color.startswith("#") or len(color) not in {4, 7}:
+        color = "#bdbab4"
+    return ["swaybg", "-c", color]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--refresh-bing", action="store_true")
+    parser.add_argument("--print-command", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    home = Path.home()
+    if args.refresh_bing:
+        refresh_bing(home)
+        return 0
+    command = swaybg_command(home, read_config(home))
+    if args.print_command:
+        print(json.dumps(command))
+        return 0
+    os.execvp(command[0], command)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
