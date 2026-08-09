@@ -157,6 +157,12 @@ impl WlrInputBackend {
                     "Failed to connect to configured Wayland socket: {e}"
                 ))
             })?;
+            if let Some(expected_uid) = config.expected_wayland_peer_uid {
+                crate::desktop::portal::xdg_desktop::wayland::verify_unix_peer_uid(
+                    &stream,
+                    expected_uid,
+                )?;
+            }
             Connection::from_socket(stream).map_err(|e| {
                 PortalError::Config(format!(
                     "Failed to initialize Wayland connection from {}: {e}",

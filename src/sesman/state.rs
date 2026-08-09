@@ -19,7 +19,8 @@ use super::{
     DEFAULT_HEIGHT, DEFAULT_WIDTH, STATE_VERSION, default_cleanup_globs, default_cleanup_paths,
     default_components, default_environment, default_idle_timeout_ms, default_log_dir,
     default_session_name, default_size, default_start_timeout_ms, default_state_dir,
-    default_stop_timeout_ms, default_true, default_user, default_xdg_runtime_dir, uid_for_user,
+    default_stop_timeout_ms, default_true, default_user, default_xdg_runtime_dir, gid_for_user,
+    uid_for_user,
 };
 
 /// Requested client geometry tracked by sesman.
@@ -137,16 +138,24 @@ impl SesmanConfig {
     /// Build production per-user defaults for the authenticated account.
     ///
     /// This layout is used by the single public RDP daemon after PAM/static
-    /// authentication. It deliberately creates only a display stack and runtime
-    /// registry under `/run/user/UID/wrdp`; it does not include an RDP
-    /// listener socket.
+    /// authentication. It separates a root-owned lifecycle registry from the
+    /// user's runtime tree:
+    ///
+    /// * `xdg_runtime_dir` = `/run/user/<uid>/wrdp` (user-owned runtime, sockets)
+    /// * `state_dir` = `/run/wrdp/sesman/<uid>` (root-owned lifecycle registry)
+    /// * `log_dir` = `/run/user/<uid>/wrdp/logs` (user-owned component logs)
+    ///
+    /// Keeping the registry out of the user runtime tree stops the target user
+    /// from tampering with the PID/identity records sesman signals against. It
+    /// does not include an RDP listener socket.
     pub fn for_user(user: &str) -> Result<Self> {
         let uid = uid_for_user(user)?;
         let runtime = PathBuf::from(format!("/run/user/{uid}/wrdp"));
         let mut config = Self::default();
         config.user = user.to_string();
         config.xdg_runtime_dir = runtime.clone();
-        config.state_dir = runtime.join("sesman");
+        // Root-owned lifecycle registry, outside the user-writable runtime tree.
+        config.state_dir = PathBuf::from(format!("/run/wrdp/sesman/{uid}"));
         config.log_dir = runtime.join("logs");
         config.cleanup_paths = vec![
             runtime.join(MANAGED_WAYLAND_SOCKET),
@@ -259,6 +268,19 @@ pub struct ComponentState {
     /// registry files written by older versions readable.
     #[serde(default)]
     pub start_ticks: Option<u64>,
+    /// Kernel boot ID (`/proc/sys/kernel/random/boot_id`) captured at spawn.
+    /// A mismatch means the host rebooted, so any PID match is coincidental.
+    /// `None` for legacy entries; such entries fail closed for signalling.
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    /// Real UID observed via `/proc/<pid>/status` at spawn. Guards against a
+    /// reused PID now owned by another account. `None` for legacy entries.
+    #[serde(default)]
+    pub uid: Option<u32>,
+    /// Process-group id observed via `/proc/<pid>/stat` at spawn, used to
+    /// authenticate group-wide teardown. `None` for legacy entries.
+    #[serde(default)]
+    pub pgid: Option<i32>,
     pub required: bool,
     /// New managed components are process-group leaders so teardown also stops
     /// children they spawn. Older registry entries default to PID-only signals.
@@ -276,6 +298,19 @@ pub struct SessionState {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub xdg_runtime_dir: PathBuf,
+    /// Kernel boot ID recorded when the session registry was created. Lets
+    /// callers detect a host reboot before trusting any persisted PID identity.
+    /// `None` for legacy registry files.
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    /// Resolved UID of the owning account at session creation. `None` for legacy
+    /// registry files.
+    #[serde(default)]
+    pub uid: Option<u32>,
+    /// Resolved primary GID of the owning account at session creation. `None`
+    /// for legacy registry files.
+    #[serde(default)]
+    pub gid: Option<u32>,
     pub default_size: SessionSize,
     pub requested_size: Option<SessionSize>,
     pub last_client: Option<ClientInfo>,
@@ -283,6 +318,14 @@ pub struct SessionState {
     pub active_clients: u32,
     #[serde(default)]
     pub last_disconnected_at: Option<DateTime<Utc>>,
+    /// Absolute instant after which an idle (no active clients) session is
+    /// eligible for automatic cleanup. Set when the last client disconnects and
+    /// cleared on bind. `None` disables idle recovery for this session (for
+    /// example when the configured idle timeout is zero). Legacy registry files
+    /// default to `None`; idle recovery then derives a deadline from
+    /// `last_disconnected_at` and the configured idle timeout.
+    #[serde(default)]
+    pub idle_deadline_at: Option<DateTime<Utc>>,
     pub components: Vec<ComponentState>,
 }
 
@@ -297,11 +340,19 @@ impl SessionState {
             created_at: now,
             updated_at: now,
             xdg_runtime_dir: config.xdg_runtime_dir.clone(),
+            // Capture boot ID and resolved account ids so later health/signal
+            // checks can fail closed on reboot or account changes. Identity
+            // resolution is best-effort here; callers persist per-component
+            // identity captured at spawn for authoritative signalling.
+            boot_id: super::process::read_boot_id(),
+            uid: uid_for_user(&config.user).ok(),
+            gid: gid_for_user(&config.user).ok(),
             default_size: config.default_size,
             requested_size: None,
             last_client: None,
             active_clients: 0,
             last_disconnected_at: None,
+            idle_deadline_at: None,
             components: Vec::new(),
         }
     }

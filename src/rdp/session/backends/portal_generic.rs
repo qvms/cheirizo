@@ -35,7 +35,7 @@
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex, atomic::AtomicBool},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::desktop::portal::xdg_desktop::{
@@ -50,6 +50,7 @@ use crate::desktop::portal::xdg_desktop::{
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::sync::atomic::Ordering;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -63,27 +64,161 @@ use crate::{
 /// video capture, input injection, and clipboard via native protocols.
 pub struct PortalSessionBackend;
 
-/// Stops a newly spawned Wayland loop if session construction fails before
+const NATIVE_THREAD_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Returns `true` only on the first call for a given flag, `false` afterwards.
+///
+/// Used to make [`SessionHandle::shutdown`] idempotent and to keep `Drop` from
+/// duplicating the session-closed report once shutdown has already run.
+fn begin_shutdown_once(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::Relaxed)
+}
+
+/// Reports a terminal session health event to supervision at most once.
+///
+/// If supervision is not attached yet, the first terminal event is latched so
+/// it can be replayed as soon as a reporter is installed. The pending-event
+/// mutex also closes the race between observing no reporter and attaching one.
+fn report_health_once(
+    reporter: &Arc<std::sync::RwLock<Option<SessionStatusReporter>>>,
+    pending_event: &Arc<Mutex<Option<SessionStatusEvent>>>,
+    reported: &AtomicBool,
+    event: SessionStatusEvent,
+) {
+    let report = {
+        // Always acquire pending_event before reporter; installation uses the
+        // same order so an event cannot be stranded after reporter attachment.
+        let mut pending_event = pending_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reported.load(Ordering::Acquire) {
+            None
+        } else if let Some(reporter) = reporter
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            reported
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+                .then_some((reporter, event))
+        } else {
+            if pending_event.is_none() {
+                *pending_event = Some(event);
+            }
+            None
+        }
+    };
+
+    if let Some((reporter, event)) = report {
+        reporter.report(event);
+    }
+}
+
+/// Installs supervision and immediately replays a terminal event that arrived
+/// before the reporter was available.
+fn install_health_reporter(
+    health_reporter: &Arc<std::sync::RwLock<Option<SessionStatusReporter>>>,
+    pending_event: &Arc<Mutex<Option<SessionStatusEvent>>>,
+    reported: &AtomicBool,
+    reporter: SessionStatusReporter,
+) {
+    let event = {
+        // Serialize attachment with report_health_once before publishing the
+        // reporter. This makes draining the pending latch atomic with install.
+        let mut pending_event = pending_event
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *health_reporter
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reporter.clone());
+
+        pending_event.take().filter(|_| {
+            reported
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+    };
+
+    if let Some(event) = event {
+        reporter.report(event);
+    }
+}
+
+/// Rolls back partially constructed session resources when setup fails before
 /// ownership can be transferred to the session handle.
-struct WaylandStopGuard {
+///
+/// On drop (while armed) it destroys any already-created input context and
+/// capture sessions/streams, signals the Wayland event loop to stop, and joins
+/// it. Because construction runs on a blocking thread, joining here is safe.
+struct ConstructionRollback {
     stop: Arc<AtomicBool>,
+    event_loop: Option<std::thread::JoinHandle<()>>,
+    input: Option<(Arc<Mutex<Box<dyn InputBackend>>>, String)>,
+    capture: Option<(
+        Arc<Mutex<Box<dyn crate::desktop::portal::xdg_desktop::CaptureBackend>>>,
+        Vec<u32>,
+    )>,
     armed: bool,
 }
 
-impl WaylandStopGuard {
-    fn new(stop: Arc<AtomicBool>) -> Self {
-        Self { stop, armed: true }
+impl ConstructionRollback {
+    fn new(stop: Arc<AtomicBool>, event_loop: std::thread::JoinHandle<()>) -> Self {
+        Self {
+            stop,
+            event_loop: Some(event_loop),
+            input: None,
+            capture: None,
+            armed: true,
+        }
     }
 
-    fn disarm(&mut self) {
+    fn set_input(&mut self, backend: Arc<Mutex<Box<dyn InputBackend>>>, session_id: String) {
+        self.input = Some((backend, session_id));
+    }
+
+    fn set_capture(
+        &mut self,
+        backend: Arc<Mutex<Box<dyn crate::desktop::portal::xdg_desktop::CaptureBackend>>>,
+        stream_ids: Vec<u32>,
+    ) {
+        self.capture = Some((backend, stream_ids));
+    }
+
+    /// Disarm the guard and return ownership of the event-loop join handle to
+    /// the successfully constructed session handle.
+    fn disarm(&mut self) -> std::thread::JoinHandle<()> {
         self.armed = false;
+        self.event_loop
+            .take()
+            .expect("event-loop join handle already taken")
     }
 }
 
-impl Drop for WaylandStopGuard {
+impl Drop for ConstructionRollback {
     fn drop(&mut self) {
-        if self.armed {
-            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if !self.armed {
+            return;
+        }
+        if let Some((backend, session_id)) = self.input.take() {
+            if let Ok(mut backend) = backend.lock() {
+                if let Err(error) = backend.destroy_context(&session_id) {
+                    warn!("portal-generic: rollback destroy input context failed: {error}");
+                }
+            }
+        }
+        if let Some((backend, stream_ids)) = self.capture.take() {
+            if !stream_ids.is_empty() {
+                if let Ok(mut backend) = backend.lock() {
+                    if let Err(error) = backend.destroy_capture_session(&stream_ids) {
+                        warn!("portal-generic: rollback destroy capture session failed: {error}");
+                    }
+                }
+            }
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.event_loop.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -119,8 +254,12 @@ fn attach_input(
     mut settings: crate::desktop::portal::xdg_desktop::services::input::InputBackendConfig,
     protocols: &crate::desktop::portal::xdg_desktop::wayland::AvailableProtocols,
     socket: Option<PathBuf>,
+    expected_wayland_peer_uid: Option<u32>,
 ) -> Result<(String, Box<dyn InputBackend>)> {
     settings.wlr.wayland_socket_path = socket;
+    // This config is also passed unchanged to the EIS bridge, whose compositor
+    // side is a WlrInputBackend.
+    settings.wlr.expected_wayland_peer_uid = expected_wayland_peer_uid;
     let mut backend = create_input_backend(&settings, protocols)
         .map_err(|error| anyhow::anyhow!("create input backend: {error}"))?;
     let id = uuid::Uuid::new_v4().simple().to_string();
@@ -170,15 +309,79 @@ fn start_monitor_capture(
 }
 
 impl PortalSessionBackend {
+    /// Attach to a managed Wayland socket with full input + clipboard support.
+    ///
+    /// Retained for compatibility; delegates to the policy-aware constructor
+    /// with both input and clipboard enabled.
     pub async fn create_session_for_wayland_socket(
         path: PathBuf,
         settings: crate::config::PortalStartupSettings,
     ) -> Result<Arc<dyn SessionHandle>> {
+        Self::create_session_for_wayland_socket_with_policy(path, settings, true, true).await
+    }
+
+    /// Attach to a managed Wayland socket, constructing only the subsystems
+    /// permitted by policy.
+    ///
+    /// When `enable_input` is `false` no input backend or input context is
+    /// created, and injection methods report the subsystem as unavailable.
+    /// When `enable_clipboard` is `false` no clipboard backend is created.
+    /// Screen capture is always retained so view-only sessions still stream.
+    pub async fn create_session_for_wayland_socket_with_policy(
+        path: PathBuf,
+        settings: crate::config::PortalStartupSettings,
+        enable_input: bool,
+        enable_clipboard: bool,
+    ) -> Result<Arc<dyn SessionHandle>> {
+        Self::create_session_for_wayland_socket_with_policy_and_peer_uid(
+            path,
+            settings,
+            enable_input,
+            enable_clipboard,
+            None,
+        )
+        .await
+    }
+
+    /// Attach to a managed Wayland socket and require the compositor peer to
+    /// have `expected_wayland_peer_uid` on each Wayland connection.
+    pub async fn create_session_for_wayland_socket_with_policy_for_uid(
+        path: PathBuf,
+        settings: crate::config::PortalStartupSettings,
+        enable_input: bool,
+        enable_clipboard: bool,
+        expected_wayland_peer_uid: u32,
+    ) -> Result<Arc<dyn SessionHandle>> {
+        Self::create_session_for_wayland_socket_with_policy_and_peer_uid(
+            path,
+            settings,
+            enable_input,
+            enable_clipboard,
+            Some(expected_wayland_peer_uid),
+        )
+        .await
+    }
+
+    async fn create_session_for_wayland_socket_with_policy_and_peer_uid(
+        path: PathBuf,
+        settings: crate::config::PortalStartupSettings,
+        enable_input: bool,
+        enable_clipboard: bool,
+        expected_wayland_peer_uid: Option<u32>,
+    ) -> Result<Arc<dyn SessionHandle>> {
         let explicit_wayland_socket = path.clone();
         Self::create_session_with_wayland(
-            move || WaylandConnection::connect_to_path(&path),
+            move || match expected_wayland_peer_uid {
+                Some(expected_uid) => {
+                    WaylandConnection::connect_to_path_for_uid(&path, expected_uid)
+                }
+                None => WaylandConnection::connect_to_path(&path),
+            },
             Some(explicit_wayland_socket),
             settings,
+            enable_input,
+            enable_clipboard,
+            expected_wayland_peer_uid,
         )
         .await
     }
@@ -187,13 +390,19 @@ impl PortalSessionBackend {
         connect_wayland: F,
         explicit_wayland_socket: Option<PathBuf>,
         settings: crate::config::PortalStartupSettings,
+        enable_input: bool,
+        enable_clipboard: bool,
+        expected_wayland_peer_uid: Option<u32>,
     ) -> Result<Arc<dyn SessionHandle>>
     where
         F: FnOnce() -> crate::desktop::portal::xdg_desktop::Result<WaylandConnection>
             + Send
             + 'static,
     {
-        info!("portal-generic: Creating session with embedded portal backend");
+        info!(
+            enable_input,
+            enable_clipboard, "portal-generic: Creating session with embedded portal backend"
+        );
 
         // All Wayland and PipeWire setup is synchronous; run on blocking thread
         let handle = tokio::task::spawn_blocking(move || -> Result<_> {
@@ -201,12 +410,30 @@ impl PortalSessionBackend {
                 prepare_wayland(connect_wayland, &settings.capture)?;
             let pipewire = Arc::new(PipeWireManager::disabled());
             let (raw_frame_tx, raw_frame_rx) = std::sync::mpsc::channel();
-            let (stop, _, capture_tx, clipboard_tx, shared_clipboard, _) = wayland
+            let (stop, _, capture_tx, clipboard_tx, shared_clipboard, event_loop) = wayland
                 .spawn_event_loop_with_frame_channel(Arc::clone(&pipewire), Some(raw_frame_tx));
-            let mut rollback = WaylandStopGuard::new(Arc::clone(&stop));
+            let mut rollback = ConstructionRollback::new(Arc::clone(&stop), event_loop);
 
-            let (session_id, input_backend) =
-                attach_input(settings.input, &protocols, explicit_wayland_socket)?;
+            // Only build the input subsystem when policy permits it. View-only
+            // sessions skip input backend/context creation entirely.
+            let input = if enable_input {
+                let (session_id, input_backend) = attach_input(
+                    settings.input,
+                    &protocols,
+                    explicit_wayland_socket,
+                    expected_wayland_peer_uid,
+                )?;
+                let input_backend = Arc::new(Mutex::new(input_backend));
+                rollback.set_input(Arc::clone(&input_backend), session_id.clone());
+                Some(PortalInput {
+                    session_id,
+                    backend: input_backend,
+                })
+            } else {
+                info!("portal-generic: input disabled by policy; skipping input backend");
+                None
+            };
+
             let (capture_backend, streams) = start_monitor_capture(
                 settings.capture,
                 &protocols,
@@ -214,26 +441,45 @@ impl PortalSessionBackend {
                 Arc::clone(&pipewire),
                 capture_tx,
             )?;
-            let clipboard_backend = create_clipboard_backend(
-                &protocols,
-                &settings.clipboard,
-                clipboard_tx,
-                shared_clipboard,
-            )
-            .map(|backend| Arc::new(Mutex::new(backend)));
+            let capture_backend = Arc::new(Mutex::new(capture_backend));
+            let capture_stream_ids: Vec<u32> =
+                streams.iter().map(|stream| stream.node_id).collect();
+            rollback.set_capture(Arc::clone(&capture_backend), capture_stream_ids.clone());
 
-            rollback.disarm();
+            // Only build the clipboard subsystem when policy permits it.
+            let clipboard_backend = if enable_clipboard {
+                create_clipboard_backend(
+                    &protocols,
+                    &settings.clipboard,
+                    clipboard_tx,
+                    shared_clipboard,
+                )
+                .map(|backend| Arc::new(Mutex::new(backend)))
+            } else {
+                info!("portal-generic: clipboard disabled by policy; skipping clipboard backend");
+                None
+            };
+
+            let event_loop = rollback.disarm();
             Ok(PortalGenericSessionHandle {
-                session_id,
+                input,
                 first_pointer_event: std::sync::atomic::AtomicBool::new(false),
-                input_backend: Arc::new(Mutex::new(input_backend)),
-                _capture_backend: Arc::new(Mutex::new(capture_backend)),
+                capture_backend,
+                capture_stream_ids,
                 clipboard_backend,
                 _pipewire_manager: pipewire,
                 streams: std::sync::Mutex::new(streams),
                 frame_rx: std::sync::Mutex::new(Some(raw_frame_rx)),
                 wayland_stop: stop,
-                health_reporter: std::sync::OnceLock::new(),
+                event_loop: std::sync::Mutex::new(Some(event_loop)),
+                bridge_stop: Arc::new(AtomicBool::new(false)),
+                bridge_handle: std::sync::Mutex::new(None),
+                shutdown_done: AtomicBool::new(false),
+                shutdown_lock: tokio::sync::Mutex::new(()),
+                shutdown_failure: std::sync::Mutex::new(None),
+                health_reporter: Arc::new(std::sync::RwLock::new(None)),
+                pending_health_event: Arc::new(std::sync::Mutex::new(None)),
+                health_reported: Arc::new(AtomicBool::new(false)),
             })
         })
         .await
@@ -243,15 +489,26 @@ impl PortalSessionBackend {
     }
 }
 
+/// Optional input subsystem for a portal-generic session.
+///
+/// Present only when policy enables input injection. View-only sessions carry
+/// `None`, and every injection path reports the subsystem as unavailable.
+struct PortalInput {
+    session_id: String,
+    backend: Arc<Mutex<Box<dyn InputBackend>>>,
+}
+
 /// Session handle for the embedded portal-generic backend.
 ///
 /// Bridges portal-generic backend traits to the `SessionHandle` interface
 /// consumed by the RDP server session layer.
 struct PortalGenericSessionHandle {
-    session_id: String,
+    /// Input backend + context id; `None` for view-only sessions.
+    input: Option<PortalInput>,
     first_pointer_event: std::sync::atomic::AtomicBool,
-    input_backend: Arc<Mutex<Box<dyn InputBackend>>>,
-    _capture_backend: Arc<Mutex<Box<dyn crate::desktop::portal::xdg_desktop::CaptureBackend>>>,
+    capture_backend: Arc<Mutex<Box<dyn crate::desktop::portal::xdg_desktop::CaptureBackend>>>,
+    /// Capture stream/node IDs created at construction, used for teardown.
+    capture_stream_ids: Vec<u32>,
     clipboard_backend:
         Option<Arc<Mutex<Box<dyn crate::desktop::portal::xdg_desktop::ClipboardBackend>>>>,
     _pipewire_manager: Arc<PipeWireManager>,
@@ -261,19 +518,45 @@ struct PortalGenericSessionHandle {
         Option<std::sync::mpsc::Receiver<crate::desktop::portal::xdg_desktop::RawFrame>>,
     >,
     wayland_stop: Arc<AtomicBool>,
-    health_reporter: std::sync::OnceLock<SessionStatusReporter>,
+    /// Wayland event-loop thread join handle, taken and joined by `shutdown`.
+    event_loop: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Stop flag for the raw-frame bridge thread (checked in its recv loop).
+    bridge_stop: Arc<AtomicBool>,
+    /// Raw-frame bridge thread join handle, taken and joined by `shutdown`.
+    bridge_handle: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Set once teardown has begun; guarantees idempotent teardown.
+    shutdown_done: AtomicBool,
+    /// Serializes shutdown callers while teardown awaits native thread joins.
+    shutdown_lock: tokio::sync::Mutex<()>,
+    /// Retains a terminal shutdown error for any later idempotent caller.
+    shutdown_failure: std::sync::Mutex<Option<String>>,
+    /// Health reporter shared with the raw-frame bridge. It can be attached
+    /// after the bridge thread has already started, so it lives behind a
+    /// shared lock rather than a move-once handle.
+    health_reporter: Arc<std::sync::RwLock<Option<SessionStatusReporter>>>,
+    /// First terminal event observed before supervision is attached.
+    pending_health_event: Arc<std::sync::Mutex<Option<SessionStatusEvent>>>,
+    /// One-shot guard coordinating the single closed/invalidated report across
+    /// the shutdown, drop, and raw-frame bridge paths.
+    health_reported: Arc<AtomicBool>,
 }
 
 impl Drop for PortalGenericSessionHandle {
     fn drop(&mut self) {
-        self.wayland_stop
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Best-effort stop only: signal both background loops but do not join
+        // (joining belongs to `shutdown`, which runs on a blocking thread).
+        self.wayland_stop.store(true, Ordering::Relaxed);
+        self.bridge_stop.store(true, Ordering::Relaxed);
         debug!("portal-generic: Wayland event loop stop signaled");
-        if let Some(reporter) = self.health_reporter.get() {
-            reporter.report(SessionStatusEvent::SessionClosed {
+        // Report closed exactly once across the shutdown/drop/bridge paths.
+        report_health_once(
+            &self.health_reporter,
+            &self.pending_health_event,
+            &self.health_reported,
+            SessionStatusEvent::SessionClosed {
                 reason: "portal-generic session dropped".into(),
-            });
-        }
+            },
+        );
     }
 }
 
@@ -305,12 +588,24 @@ fn normalize_absolute_pointer_position(
     ((x / width).clamp(0.0, 1.0), (y / height).clamp(0.0, 1.0))
 }
 
+/// Error returned by injection paths when the session has no input backend
+/// (view-only policy). Kept as a named helper so the message stays consistent
+/// and is unit-testable.
+fn input_unavailable_error(operation: &str) -> anyhow::Error {
+    anyhow::anyhow!("{operation}: input injection is not available for this view-only session")
+}
+
 impl PortalGenericSessionHandle {
     fn inject(&self, event: InputEvent, operation: &str) -> Result<()> {
-        self.input_backend
+        let input = self
+            .input
+            .as_ref()
+            .ok_or_else(|| input_unavailable_error(operation))?;
+        input
+            .backend
             .lock()
             .map_err(|_| anyhow::anyhow!("input backend lock poisoned"))?
-            .inject_event(&self.session_id, event)
+            .inject_event(&input.session_id, event)
             .map_err(|error| anyhow::anyhow!("{operation}: {error}"))
     }
 }
@@ -318,7 +613,12 @@ impl PortalGenericSessionHandle {
 #[async_trait]
 impl SessionHandle for PortalGenericSessionHandle {
     fn set_health_reporter(&self, reporter: SessionStatusReporter) {
-        let _ = self.health_reporter.set(reporter);
+        install_health_reporter(
+            &self.health_reporter,
+            &self.pending_health_event,
+            &self.health_reported,
+            reporter,
+        );
     }
 
     fn direct_frame_receiver(&self) -> Result<DirectFrameReceiver> {
@@ -344,12 +644,19 @@ impl SessionHandle for PortalGenericSessionHandle {
         // retaining stale queued frames, which makes latency grow during a
         // stall. Here newer capture replaces the pending frame instead.
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        if let Err(e) = std::thread::Builder::new()
+        let bridge_stop = Arc::clone(&self.bridge_stop);
+        let health_reporter = Arc::clone(&self.health_reporter);
+        let pending_health_event = Arc::clone(&self.pending_health_event);
+        let health_reported = Arc::clone(&self.health_reported);
+        let handle = std::thread::Builder::new()
             .name("raw-frame-bridge".into())
             .spawn(move || {
                 let mut pending = None;
                 let mut dropped: u64 = 0;
                 loop {
+                    if bridge_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                     if let Some(frame) = pending.take() {
                         match tx.try_send(frame) {
                             Ok(()) => {}
@@ -380,8 +687,30 @@ impl SessionHandle for PortalGenericSessionHandle {
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            if let Some(frame) = pending {
-                                let _ = tx.send(frame);
+                            // Never block on the output channel during teardown:
+                            // attempt a single non-blocking flush of the pending
+                            // frame and exit regardless of the result.
+                            if let Some(frame) = pending.take() {
+                                let _ = tx.try_send(frame);
+                            }
+                            // A disconnect while no stop was requested means the
+                            // compositor/capture side vanished. Invalidate the
+                            // session exactly once so supervision drives it
+                            // Invalid. Intentional shutdown sets `bridge_stop`
+                            // before the channel closes, so it is skipped here.
+                            if !bridge_stop.load(Ordering::Relaxed) {
+                                warn!(
+                                    "portal-generic: raw frame channel disconnected unexpectedly; invalidating session"
+                                );
+                                report_health_once(
+                                    &health_reporter,
+                                    &pending_health_event,
+                                    &health_reported,
+                                    SessionStatusEvent::SessionInvalidated {
+                                        reason: "portal-generic raw frame channel disconnected"
+                                            .into(),
+                                    },
+                                );
                             }
                             break;
                         }
@@ -389,9 +718,12 @@ impl SessionHandle for PortalGenericSessionHandle {
                 }
                 info!("portal-generic: raw-frame-bridge thread exited");
             })
-        {
-            anyhow::bail!("failed to spawn raw-frame-bridge thread: {e}");
-        }
+            .map_err(|e| anyhow::anyhow!("failed to spawn raw-frame-bridge thread: {e}"))?;
+
+        *self
+            .bridge_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
 
         Ok(rx)
     }
@@ -404,21 +736,23 @@ impl SessionHandle for PortalGenericSessionHandle {
     }
 
     fn set_streams(&self, streams: Vec<StreamInfo>) {
-        if let Ok(mut backend) = self.input_backend.lock() {
-            backend.set_stream_mappings(
-                streams
-                    .iter()
-                    .map(
-                        |stream| crate::desktop::portal::xdg_desktop::types::StreamOutputMapping {
-                            stream_node_id: stream.node_id,
-                            x: stream.position_x,
-                            y: stream.position_y,
-                            width: stream.width,
-                            height: stream.height,
-                        },
-                    )
-                    .collect(),
-            );
+        if let Some(input) = self.input.as_ref() {
+            if let Ok(mut backend) = input.backend.lock() {
+                backend.set_stream_mappings(
+                    streams
+                        .iter()
+                        .map(|stream| {
+                            crate::desktop::portal::xdg_desktop::types::StreamOutputMapping {
+                                stream_node_id: stream.node_id,
+                                x: stream.position_x,
+                                y: stream.position_y,
+                                width: stream.width,
+                                height: stream.height,
+                            }
+                        })
+                        .collect(),
+                );
+            }
         }
         *self
             .streams
@@ -499,6 +833,134 @@ impl SessionHandle for PortalGenericSessionHandle {
         self.inject(event, "pointer scroll injection")
     }
 
+    async fn shutdown(&self) -> Result<()> {
+        let _shutdown_guard = self.shutdown_lock.lock().await;
+
+        // Idempotent after success, while retaining a prior terminal failure.
+        if !begin_shutdown_once(&self.shutdown_done) {
+            if let Some(error) = self
+                .shutdown_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+            {
+                anyhow::bail!("{error}");
+            }
+            return Ok(());
+        }
+
+        let mut failures = Vec::new();
+
+        // Destroy the input context for this session, if input was enabled.
+        if let Some(input) = self.input.as_ref() {
+            match input.backend.lock() {
+                Ok(mut backend) => {
+                    if let Err(error) = backend.destroy_context(&input.session_id) {
+                        failures.push(format!("destroy input context: {error}"));
+                    }
+                }
+                Err(_) => failures.push("input backend lock poisoned".to_string()),
+            }
+        }
+
+        // Destroy the capture sessions/streams created at construction.
+        if !self.capture_stream_ids.is_empty() {
+            match self.capture_backend.lock() {
+                Ok(mut backend) => {
+                    if let Err(error) = backend.destroy_capture_session(&self.capture_stream_ids) {
+                        failures.push(format!("destroy capture session: {error}"));
+                    }
+                }
+                Err(_) => failures.push("capture backend lock poisoned".to_string()),
+            }
+        }
+
+        // Signal the event loop and raw-frame bridge to stop.
+        self.wayland_stop.store(true, Ordering::Relaxed);
+        self.bridge_stop.store(true, Ordering::Relaxed);
+
+        // Both native loops cooperatively poll their stop flags (Wayland at
+        // roughly 100ms, bridge at 8ms). Join off-runtime, but bound the await:
+        // a timeout is fatal so production exits rather than detaching a live
+        // compositor loop and continuing to serve another connection.
+        let event_loop = self
+            .event_loop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let bridge_handle = self
+            .bridge_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        // Use a standalone coordinator rather than Tokio's blocking pool. If a
+        // native loop violates its cooperative-stop contract, production returns
+        // a fatal error and process exit is not held open by a blocked Tokio
+        // worker. On success the completion channel proves both joins finished.
+        let (join_tx, join_rx) = tokio::sync::oneshot::channel();
+        match std::thread::Builder::new()
+            .name("portal-join-coordinator".into())
+            .spawn(move || {
+                let mut panics = Vec::new();
+                if let Some(handle) = event_loop
+                    && handle.join().is_err()
+                {
+                    panics.push("Wayland event-loop thread panicked");
+                }
+                if let Some(handle) = bridge_handle
+                    && handle.join().is_err()
+                {
+                    panics.push("raw-frame bridge thread panicked");
+                }
+                let _ = join_tx.send(panics);
+            }) {
+            Ok(_coordinator) => {
+                match tokio::time::timeout(NATIVE_THREAD_JOIN_TIMEOUT, join_rx).await {
+                    Ok(Ok(panics)) => failures.extend(panics.into_iter().map(str::to_string)),
+                    Ok(Err(recv_error)) => {
+                        failures.push(format!(
+                            "native join coordinator exited without a result: {recv_error}"
+                        ));
+                    }
+                    Err(_) => {
+                        failures.push(format!(
+                            "native threads did not stop within {NATIVE_THREAD_JOIN_TIMEOUT:?}"
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                failures.push(format!("failed to spawn native join coordinator: {error}"));
+            }
+        }
+
+        // Report the session closed exactly once across shutdown/drop/bridge,
+        // including teardown failures (which are returned to production).
+        report_health_once(
+            &self.health_reporter,
+            &self.pending_health_event,
+            &self.health_reported,
+            SessionStatusEvent::SessionClosed {
+                reason: "portal-generic session shutdown".into(),
+            },
+        );
+
+        if failures.is_empty() {
+            debug!("portal-generic: session shutdown complete");
+            Ok(())
+        } else {
+            let error = format!(
+                "portal-generic session shutdown failed: {}",
+                failures.join("; ")
+            );
+            *self
+                .shutdown_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
+            anyhow::bail!(error)
+        }
+    }
+
     fn clipboard_source(&self) -> crate::rdp::session::backend::ClipboardSource {
         match self.clipboard_backend.as_ref() {
             Some(backend) => {
@@ -517,6 +979,16 @@ mod tests {
     fn test_current_time_usec() {
         let time = current_time_usec();
         assert!(time > 0);
+    }
+
+    #[test]
+    fn begin_shutdown_once_is_idempotent() {
+        let flag = AtomicBool::new(false);
+        // First call wins and returns true; subsequent calls are no-ops.
+        assert!(begin_shutdown_once(&flag));
+        assert!(!begin_shutdown_once(&flag));
+        assert!(!begin_shutdown_once(&flag));
+        assert!(flag.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -542,5 +1014,95 @@ mod tests {
         let (x, y) = normalize_absolute_pointer_position(&[], 7, 2.0, -1.0);
 
         assert_eq!((x, y), (1.0, 0.0));
+    }
+
+    #[test]
+    fn input_unavailable_error_mentions_view_only() {
+        let error = input_unavailable_error("keyboard injection");
+        let message = error.to_string();
+        assert!(message.contains("keyboard injection"));
+        assert!(message.contains("not available"));
+        assert!(message.contains("view-only"));
+    }
+
+    #[tokio::test]
+    async fn early_invalidation_replays_after_reporter_attachment() {
+        use crate::rdp::session::supervision::{OverallStatus, SessionSupervisor};
+
+        let health_reporter: Arc<std::sync::RwLock<Option<SessionStatusReporter>>> =
+            Arc::new(std::sync::RwLock::new(None));
+        let pending_event = Arc::new(Mutex::new(None));
+        let reported = AtomicBool::new(false);
+
+        report_health_once(
+            &health_reporter,
+            &pending_event,
+            &reported,
+            SessionStatusEvent::SessionInvalidated {
+                reason: "early disconnect".into(),
+            },
+        );
+        assert!(!reported.load(Ordering::Acquire));
+        assert!(pending_event.lock().unwrap().is_some());
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (monitor, reporter, subscriber) = SessionSupervisor::new(shutdown_tx.subscribe());
+        let monitor_handle = tokio::spawn(monitor.run());
+        install_health_reporter(&health_reporter, &pending_event, &reported, reporter);
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(reported.load(Ordering::Acquire));
+        assert!(pending_event.lock().unwrap().is_none());
+        assert_eq!(subscriber.current().overall, OverallStatus::Invalid);
+
+        let _ = shutdown_tx.send(());
+        let _ = monitor_handle.await;
+    }
+
+    #[tokio::test]
+    async fn unexpected_disconnect_reports_invalidated_once() {
+        use crate::rdp::session::supervision::{OverallStatus, SessionSupervisor};
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (monitor, reporter, subscriber) = SessionSupervisor::new(shutdown_tx.subscribe());
+        let monitor_handle = tokio::spawn(monitor.run());
+
+        let reporter = Arc::new(std::sync::RwLock::new(Some(reporter)));
+        let pending_event = Arc::new(Mutex::new(None));
+        let reported = Arc::new(AtomicBool::new(false));
+
+        // Simulate the raw-frame bridge observing an unexpected disconnect while
+        // no stop was requested.
+        report_health_once(
+            &reporter,
+            &pending_event,
+            &reported,
+            SessionStatusEvent::SessionInvalidated {
+                reason: "portal-generic raw frame channel disconnected".into(),
+            },
+        );
+        assert!(reported.load(Ordering::Relaxed));
+
+        // A later shutdown/drop must not double-report.
+        report_health_once(
+            &reporter,
+            &pending_event,
+            &reported,
+            SessionStatusEvent::SessionClosed {
+                reason: "portal-generic session shutdown".into(),
+            },
+        );
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let state = subscriber.current();
+        assert_eq!(state.overall, OverallStatus::Invalid);
+        assert!(!subscriber.is_session_valid());
+
+        let _ = shutdown_tx.send(());
+        let _ = monitor_handle.await;
     }
 }

@@ -12,17 +12,24 @@
 
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
-    io::Write as _,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    fs::{self, File, OpenOptions},
+    io::{Read as _, Write as _},
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        net::UnixStream,
+    },
+    path::{Component, Path, PathBuf},
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use nix::sys::signal::Signal;
+use nix::{
+    fcntl::{Flock, FlockArg},
+    sys::signal::Signal,
+    unistd::{Gid, Uid, fchown},
+};
 use tracing::{debug, info, warn};
 
 use crate::desktop::compositor::{
@@ -33,7 +40,7 @@ use crate::desktop::compositor::{
     },
 };
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 const DEFAULT_SESSION_NAME: &str = "default";
 const DEFAULT_WIDTH: u32 = 1920;
 const DEFAULT_HEIGHT: u32 = 1080;
@@ -47,9 +54,9 @@ mod process;
 mod state;
 
 use identity::{gid_for_user, home_dir_for_user, supplementary_groups_for_user, uid_for_user};
-pub(crate) use process::process_start_ticks;
+pub(crate) use process::{CapturedIdentity, capture_identity, process_alive};
 use process::{
-    chown_path, process_group_alive, process_matches, process_started_at, signal_process,
+    MatchPurpose, ProcessSignature, process_group_alive, process_matches, signal_process,
 };
 
 pub use state::{
@@ -73,12 +80,8 @@ impl SessionManager {
 
     /// Ensure a usable session exists, reusing healthy processes when possible.
     pub fn ensure(&self, options: EnsureOptions) -> Result<EnsureResult> {
+        self.prepare_directories()?;
         let _lock = FileLock::acquire(&self.config.lock_path())?;
-        fs::create_dir_all(&self.config.state_dir).context("failed to create sesman state dir")?;
-        fs::create_dir_all(&self.config.log_dir).context("failed to create sesman log dir")?;
-        fs::create_dir_all(&self.config.xdg_runtime_dir)
-            .context("failed to create XDG runtime dir")?;
-        self.prepare_runtime_ownership()?;
 
         let mut status = self.status()?;
         if options.force_restart {
@@ -111,7 +114,7 @@ impl SessionManager {
             self.stop_locked()?;
         }
 
-        self.cleanup_runtime_paths();
+        self.cleanup_runtime_paths()?;
         let mut state = SessionState::new(&self.config);
         self.update_reconnect_state(&mut state, &options);
 
@@ -150,15 +153,18 @@ impl SessionManager {
     /// Return current persisted session status.
     pub fn status(&self) -> Result<SessionStatus> {
         let state_path = self.config.state_path();
-        let state = match fs::read_to_string(&state_path) {
+        let state = match self.read_state_file(&state_path) {
             Ok(content) => Some(
                 serde_json::from_str::<SessionState>(&content)
                     .with_context(|| format!("failed to parse {}", state_path.display()))?,
             ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(e).with_context(|| format!("failed to read {}", state_path.display()));
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                None
             }
+            Err(e) => return Err(e),
         };
 
         let Some(ref session_state) = state else {
@@ -192,16 +198,11 @@ impl SessionManager {
                 };
 
                 let process_matches_state = component.command == expected_command
-                    && process_matches(
-                        component.pid,
-                        &component.command,
-                        component.started_at,
-                        component.start_ticks,
-                    );
+                    && process_matches(&component_signature(component), MatchPurpose::Status);
                 let ready = process_matches_state
                     && match &configured.readiness {
                         ReadinessCheck::None | ReadinessCheck::ProcessAlive => true,
-                        ReadinessCheck::UnixSocket { path } => path.exists(),
+                        ReadinessCheck::UnixSocket { path } => self.unix_socket_ready(path),
                     };
                 if ready {
                     alive_components += 1;
@@ -264,6 +265,7 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("healthy status without state"))?;
         state.active_clients = 1;
         state.last_disconnected_at = None;
+        state.idle_deadline_at = None;
         state.mark_updated();
         self.write_state(&state)?;
         self.status()
@@ -277,8 +279,10 @@ impl SessionManager {
         let Some(mut state) = status.state else {
             return Ok(status);
         };
+        let now = Utc::now();
         state.active_clients = 0;
-        state.last_disconnected_at = Some(Utc::now());
+        state.last_disconnected_at = Some(now);
+        state.idle_deadline_at = self.idle_deadline_after(now);
         state.mark_updated();
         self.write_state(&state)?;
         self.status()
@@ -293,7 +297,9 @@ impl SessionManager {
         };
         state.active_clients = state.active_clients.saturating_sub(1);
         if state.active_clients == 0 {
-            state.last_disconnected_at = Some(Utc::now());
+            let now = Utc::now();
+            state.last_disconnected_at = Some(now);
+            state.idle_deadline_at = self.idle_deadline_after(now);
         }
         state.mark_updated();
         self.write_state(&state)?;
@@ -303,11 +309,56 @@ impl SessionManager {
     /// Stop an idle persisted session if it has exceeded the configured idle window.
     /// Returns `Ok(true)` when a session was stopped.
     pub fn cleanup_idle(&self) -> Result<bool> {
-        if self.config.idle_timeout_ms == 0 {
-            return Ok(false);
-        }
-
         let _lock = FileLock::acquire(&self.config.lock_path())?;
+        self.cleanup_idle_locked()
+    }
+
+    /// Reconcile persisted state after the owning daemon restarted.
+    ///
+    /// A daemon crash can leave `active_clients` above zero with no live RDP
+    /// connection, and (for a legacy or partially written registry) without a
+    /// recorded disconnect time or idle deadline. Under the registry lock this
+    /// zeroes any stale client count, records a disconnect time and idle
+    /// deadline when missing, persists the reconciled state, and then runs idle
+    /// cleanup inline via [`Self::cleanup_idle_locked`] so an already-overdue
+    /// session is stopped without releasing and re-acquiring the lock.
+    pub fn reconcile_after_daemon_restart(&self) -> Result<SessionStatus> {
+        let _lock = FileLock::acquire(&self.config.lock_path())?;
+        let status = self.status()?;
+        let Some(mut state) = status.state else {
+            return Ok(status);
+        };
+        let now = Utc::now();
+        let mut changed = false;
+        if state.active_clients > 0 {
+            state.active_clients = 0;
+            changed = true;
+        }
+        if state.active_clients == 0 && state.last_disconnected_at.is_none() {
+            state.last_disconnected_at = Some(now);
+            changed = true;
+        }
+        if state.active_clients == 0
+            && state.idle_deadline_at.is_none()
+            && self.config.idle_timeout_ms != 0
+        {
+            let base = state.last_disconnected_at.unwrap_or(now);
+            state.idle_deadline_at = self.idle_deadline_after(base);
+            changed = true;
+        }
+        if changed {
+            state.mark_updated();
+            self.write_state(&state)?;
+        }
+        self.cleanup_idle_locked()?;
+        self.status()
+    }
+
+    /// Idle-cleanup body shared by [`Self::cleanup_idle`] and
+    /// [`Self::reconcile_after_daemon_restart`]. The registry lock must already
+    /// be held by the caller; this method never acquires it, avoiding a
+    /// double-lock during restart reconciliation.
+    fn cleanup_idle_locked(&self) -> Result<bool> {
         let status = self.status()?;
         if status.health == SessionHealth::Missing {
             return Ok(false);
@@ -318,23 +369,42 @@ impl SessionManager {
         if state.active_clients > 0 {
             return Ok(false);
         }
-        let Some(last_disconnected_at) = state.last_disconnected_at else {
+        let Some(deadline) = self.effective_idle_deadline(&state) else {
             return Ok(false);
         };
-        let idle_ms = Utc::now()
-            .signed_duration_since(last_disconnected_at)
-            .num_milliseconds()
-            .max(0) as u64;
-        if idle_ms < self.config.idle_timeout_ms {
+        if Utc::now() < deadline {
             return Ok(false);
         }
 
         info!(
-            "stopping idle session {} for user {} after {}ms idle",
-            state.name, state.user, idle_ms
+            "stopping idle session {} for user {} past idle deadline {deadline}",
+            state.name, state.user
         );
         self.stop_locked()?;
         Ok(true)
+    }
+
+    /// Compute the idle deadline for a disconnect happening at `base`, or `None`
+    /// when idle recovery is disabled (`idle_timeout_ms == 0`).
+    fn idle_deadline_after(&self, base: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        if self.config.idle_timeout_ms == 0 {
+            return None;
+        }
+        Some(base + chrono::Duration::milliseconds(self.config.idle_timeout_ms as i64))
+    }
+
+    /// Resolve the effective idle deadline for a session. A persisted deadline
+    /// is authoritative; a legacy registry without one derives a deadline from
+    /// `last_disconnected_at` plus the configured idle timeout. Returns `None`
+    /// when idle recovery is disabled or no disconnect time is available.
+    fn effective_idle_deadline(&self, state: &SessionState) -> Option<DateTime<Utc>> {
+        if let Some(deadline) = state.idle_deadline_at {
+            return Some(deadline);
+        }
+        if self.config.idle_timeout_ms == 0 {
+            return None;
+        }
+        self.idle_deadline_after(state.last_disconnected_at?)
     }
 
     fn stop_locked(&self) -> Result<()> {
@@ -346,22 +416,18 @@ impl SessionManager {
     }
 
     fn stop_state(&self, state: &SessionState) -> Result<()> {
-        // A registry file with another user/session identity is untrusted. Remove
-        // it below, but never use its PIDs as signal targets. Authorize targets
-        // once, before signalling: a group remains ours after its leader exits,
-        // while recomputing leader identity would abandon surviving children.
+        // Authorize every target exactly once while its leader identity is still
+        // observable. A process group can remain alive after the leader exits,
+        // but it is safe to keep checking that group only after authenticating
+        // the leader and proving that the persisted PGID is the group we signal.
         let state_is_owned = self.state_belongs_to_config(state);
         let authorized: Vec<bool> = state
             .components
             .iter()
             .map(|component| {
                 state_is_owned
-                    && process_matches(
-                        component.pid,
-                        &component.command,
-                        component.started_at,
-                        component.start_ticks,
-                    )
+                    && process_matches(&component_signature(component), MatchPurpose::Signal)
+                    && (!component.process_group || component.pgid == Some(component.pid))
             })
             .collect();
         let target_alive = |index: usize, component: &ComponentState| {
@@ -369,13 +435,15 @@ impl SessionManager {
                 && if component.process_group {
                     process_group_alive(component.pid)
                 } else {
-                    process_matches(
-                        component.pid,
-                        &component.command,
-                        component.started_at,
-                        component.start_ticks,
-                    )
+                    process_matches(&component_signature(component), MatchPurpose::Signal)
                 }
+        };
+        let all_targets_stopped = || {
+            state
+                .components
+                .iter()
+                .enumerate()
+                .all(|(index, component)| !target_alive(index, component))
         };
 
         for (index, component) in state.components.iter().enumerate().rev() {
@@ -391,16 +459,8 @@ impl SessionManager {
             }
         }
 
-        let deadline = Instant::now() + Duration::from_millis(self.config.stop_timeout_ms);
-        while Instant::now() < deadline {
-            if state
-                .components
-                .iter()
-                .enumerate()
-                .all(|(index, component)| !target_alive(index, component))
-            {
-                break;
-            }
+        let term_deadline = Instant::now() + Duration::from_millis(self.config.stop_timeout_ms);
+        while Instant::now() < term_deadline && !all_targets_stopped() {
             thread::sleep(Duration::from_millis(100));
         }
 
@@ -417,24 +477,42 @@ impl SessionManager {
             }
         }
 
-        let state_path = self.config.state_path();
-        match fs::remove_file(&state_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("failed to remove {}", state_path.display()));
-            }
+        // SIGKILL delivery is asynchronous. Keep the authenticated registry if
+        // any target survives so a later operator/retry can inspect and stop it.
+        let kill_deadline = Instant::now() + Duration::from_millis(self.config.stop_timeout_ms);
+        while Instant::now() < kill_deadline && !all_targets_stopped() {
+            thread::sleep(Duration::from_millis(100));
         }
-        self.cleanup_runtime_paths();
-        Ok(())
+        let survivors: Vec<String> = state
+            .components
+            .iter()
+            .enumerate()
+            .filter(|(index, component)| target_alive(*index, component))
+            .map(|(_, component)| component.name.clone())
+            .collect();
+        if !survivors.is_empty() {
+            bail!(
+                "managed targets survived SIGKILL; retaining session state: {}",
+                survivors.join(", ")
+            );
+        }
+
+        // Required cleanup happens before deleting the registry. If cleanup
+        // fails, retain state rather than claiming teardown completed.
+        self.cleanup_runtime_paths()?;
+        self.remove_state_file(&self.config.state_path())
     }
 
     fn state_belongs_to_config(&self, state: &SessionState) -> bool {
+        let expected_uid = uid_for_user(&self.config.user).ok();
+        let expected_gid = gid_for_user(&self.config.user).ok();
         state.version == STATE_VERSION
             && state.name == self.config.session_name
             && state.user == self.config.user
             && state.xdg_runtime_dir == self.config.xdg_runtime_dir
+            && state.boot_id.as_deref() == process::read_boot_id().as_deref()
+            && state.uid == expected_uid
+            && state.gid == expected_gid
     }
 
     fn status_can_serve(&self, status: &SessionStatus) -> bool {
@@ -463,24 +541,71 @@ impl SessionManager {
         if options.client_connected {
             state.active_clients = state.active_clients.saturating_add(1);
             state.last_disconnected_at = None;
+            state.idle_deadline_at = None;
         }
         state.mark_updated();
     }
 
-    fn prepare_runtime_ownership(&self) -> Result<()> {
-        let uid = uid_for_user(&self.config.user)?;
-        let gid = gid_for_user(&self.config.user)?;
-        for path in [
-            &self.config.xdg_runtime_dir,
-            &self.config.state_dir,
-            &self.config.log_dir,
-        ] {
-            chown_path(path, uid, gid)
-                .with_context(|| format!("failed to chown {}", path.display()))?;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-                .context("failed to restrict sesman state directory")?;
+    /// Create and validate the directories which contain trusted sesman state
+    /// and user-controlled runtime artifacts.  Never chmod/chown a path until
+    /// it has been checked with `symlink_metadata`; ownership changes happen on
+    /// an opened directory descriptor.
+    fn prepare_directories(&self) -> Result<()> {
+        let target_uid = uid_for_user(&self.config.user)?;
+        let target_gid = gid_for_user(&self.config.user)?;
+        let effective_uid = Uid::effective().as_raw();
+        let effective_gid = Gid::effective().as_raw();
+
+        if self.is_production_runtime(target_uid) {
+            let runtime_root = PathBuf::from(format!("/run/user/{target_uid}"));
+            let metadata = fs::symlink_metadata(&runtime_root).with_context(|| {
+                format!(
+                    "production runtime root {} is unavailable",
+                    runtime_root.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != target_uid
+            {
+                bail!(
+                    "unsafe production runtime root {}; expected directory owned by {target_uid}",
+                    runtime_root.display()
+                );
+            }
         }
-        Ok(())
+
+        ensure_secure_directory(
+            &self.config.state_dir,
+            effective_uid,
+            effective_gid,
+            true,
+            "sesman state directory",
+        )?;
+        ensure_secure_directory(
+            &self.config.xdg_runtime_dir,
+            target_uid,
+            target_gid,
+            true,
+            "user runtime directory",
+        )?;
+        ensure_secure_directory(
+            &self.config.log_dir,
+            target_uid,
+            target_gid,
+            true,
+            "component log directory",
+        )
+    }
+
+    fn is_production_runtime(&self, target_uid: u32) -> bool {
+        self.config.xdg_runtime_dir == PathBuf::from(format!("/run/user/{target_uid}/wrdp"))
+    }
+
+    fn is_production_registry(&self) -> bool {
+        uid_for_user(&self.config.user).is_ok_and(|uid| {
+            self.config.state_dir == PathBuf::from(format!("/run/wrdp/sesman/{uid}"))
+        })
     }
 
     fn spawn_component(&self, component: &ComponentConfig) -> Result<ComponentState> {
@@ -509,8 +634,10 @@ impl SessionManager {
             let alive = state
                 .components
                 .iter()
-                .find(|c| c.name == component.name)
-                .is_some_and(|c| process_matches(c.pid, &c.command, c.started_at, c.start_ticks));
+                .find(|candidate| candidate.name == component.name)
+                .is_some_and(|candidate| {
+                    process_matches(&component_signature(candidate), MatchPurpose::Status)
+                });
             if !alive {
                 if component.required {
                     bail!("component {} exited before becoming ready", component.name);
@@ -523,10 +650,10 @@ impl SessionManager {
             }
 
             match &component.readiness {
-                ReadinessCheck::None => return Ok(()),
-                ReadinessCheck::ProcessAlive if alive => return Ok(()),
-                ReadinessCheck::ProcessAlive => {}
-                ReadinessCheck::UnixSocket { path } if path.exists() => return Ok(()),
+                ReadinessCheck::None | ReadinessCheck::ProcessAlive => return Ok(()),
+                ReadinessCheck::UnixSocket { path } if self.unix_socket_ready(path) => {
+                    return Ok(());
+                }
                 ReadinessCheck::UnixSocket { .. } => {}
             }
 
@@ -547,8 +674,67 @@ impl SessionManager {
         }
     }
 
-    fn cleanup_runtime_paths(&self) {
-        cleanup::cleanup_runtime_paths(&self.config.cleanup_paths, &self.config.cleanup_globs);
+    fn unix_socket_ready(&self, path: &Path) -> bool {
+        let Ok(target_uid) = uid_for_user(&self.config.user) else {
+            return false;
+        };
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        !metadata.file_type().is_symlink()
+            && metadata.file_type().is_socket()
+            && metadata.uid() == target_uid
+            && UnixStream::connect(path).is_ok()
+    }
+
+    fn cleanup_runtime_paths(&self) -> Result<()> {
+        cleanup::cleanup_runtime_paths(&self.config.cleanup_paths, &self.config.cleanup_globs)
+    }
+
+    fn read_state_file(&self, path: &Path) -> Result<String> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("unsafe sesman state file: {}", path.display());
+        }
+        if self.is_production_registry() && metadata.uid() != Uid::effective().as_raw() {
+            bail!("untrusted production sesman state file: {}", path.display());
+        }
+
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed to inspect opened state file {}", path.display()))?;
+        if !metadata.is_file()
+            || (self.is_production_registry() && metadata.uid() != Uid::effective().as_raw())
+        {
+            bail!("untrusted sesman state file: {}", path.display());
+        }
+        let mut content = String::new();
+        file.read_to_string(&mut content)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(content)
+    }
+
+    fn remove_state_file(&self, path: &Path) -> Result<()> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("unsafe sesman state file: {}", path.display());
+        }
+        if self.is_production_registry() && metadata.uid() != Uid::effective().as_raw() {
+            bail!("untrusted production sesman state file: {}", path.display());
+        }
+        fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
     }
 
     fn write_state(&self, state: &SessionState) -> Result<()> {
@@ -584,75 +770,336 @@ impl SessionManager {
     }
 }
 
+/// An advisory, process-lifetime registry lock.  The lock file is deliberately
+/// retained: `flock(2)` releases it automatically when this descriptor closes,
+/// so there is no stale-file recovery race or unlink window.
 struct FileLock {
-    path: PathBuf,
+    _file: Flock<File>,
 }
 
 impl FileLock {
     fn acquire(path: &Path) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context("failed to create sesman lock dir")?;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                .context("failed to restrict sesman lock dir")?;
-        }
-
-        match OpenOptions::new()
+        let file = OpenOptions::new()
+            .read(true)
             .write(true)
-            .create_new(true)
+            .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)
-        {
-            Ok(mut file) => {
-                let pid = i32::try_from(std::process::id()).context("lock pid did not fit i32")?;
-                let start_ticks = process_start_ticks(pid)
-                    .ok_or_else(|| anyhow!("failed to read lock process start time"))?;
-                writeln!(file, "{pid} {start_ticks}").context("failed to write lock identity")?;
-                Ok(Self {
-                    path: path.to_path_buf(),
-                })
+            .with_context(|| format!("failed to open lock {}", path.display()))?;
+        let file = Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, error)| {
+            anyhow!("session is already locked: {}: {error}", path.display())
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+fn component_signature(component: &ComponentState) -> ProcessSignature<'_> {
+    ProcessSignature {
+        pid: component.pid,
+        command: &component.command,
+        started_at: component.started_at,
+        start_ticks: component.start_ticks,
+        boot_id: component.boot_id.as_deref(),
+        uid: component.uid,
+        pgid: component.pgid,
+    }
+}
+
+/// Securely create a directory hierarchy and validate the final directory.
+/// Ancestors are never chmodded/chowned; only the leaf is managed by sesman.
+fn ensure_secure_directory(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    chown_created: bool,
+    description: &str,
+) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("{description} must be absolute: {}", path.display());
+    }
+
+    let mut current = PathBuf::from("/");
+    let mut created_leaf = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => current.push(name),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                bail!("unsafe {description} path: {}", path.display());
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if stale_lock(path)? {
-                    warn!("removing stale sesman lock {}", path.display());
-                    fs::remove_file(path).with_context(|| {
-                        format!("failed to remove stale lock {}", path.display())
-                    })?;
-                    Self::acquire(path)
-                } else {
-                    Err(anyhow!("session is already locked: {}", path.display()))
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!("unsafe {description}: {}", current.display());
                 }
             }
-            Err(e) => Err(e).with_context(|| format!("failed to create lock {}", path.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {
+                        if current == path {
+                            created_leaf = true;
+                        }
+                    }
+                    // Another concurrent session setup created this component.
+                    // Revalidate it below before accepting it.
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to create {description} {}", current.display())
+                        });
+                    }
+                }
+                let metadata = fs::symlink_metadata(&current).with_context(|| {
+                    format!("failed to inspect {description} {}", current.display())
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    bail!("unsafe {description}: {}", current.display());
+                }
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to inspect {description} {}", current.display())
+                });
+            }
         }
     }
-}
 
-fn stale_lock(path: &Path) -> Result<bool> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read lock {}", path.display()))?;
-    let mut fields = content.split_whitespace();
-    let Some(pid) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
-        return Ok(true);
-    };
-    let Some(recorded_start_ticks) = fields.next().and_then(|value| value.parse::<u64>().ok())
-    else {
-        // Legacy locks recorded only a PID. Compare process start time with the
-        // lock mtime so a later process that reused the PID cannot retain it.
-        let lock_modified: DateTime<Utc> = fs::metadata(path)
-            .with_context(|| format!("failed to stat lock {}", path.display()))?
-            .modified()
-            .with_context(|| format!("failed to read lock mtime {}", path.display()))?
-            .into();
-        return Ok(process_started_at(pid).is_none_or(|started| started > lock_modified));
-    };
-    Ok(process_start_ticks(pid) != Some(recorded_start_ticks))
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+    // Open the already checked leaf without following a replacement symlink;
+    // permissions and ownership are then changed through this descriptor.
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open {description} {}", path.display()))?;
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("failed to inspect opened {description} {}", path.display()))?;
+    if !metadata.is_dir() {
+        bail!("unsafe {description}: {}", path.display());
     }
+
+    if created_leaf && chown_created {
+        fchown(
+            &directory,
+            Some(Uid::from_raw(uid)),
+            Some(Gid::from_raw(gid)),
+        )
+        .with_context(|| format!("failed to chown {description} {}", path.display()))?;
+    }
+    let metadata = directory
+        .metadata()
+        .with_context(|| format!("failed to inspect {description} {}", path.display()))?;
+    if metadata.uid() != uid || metadata.gid() != gid {
+        bail!(
+            "{description} {} is not owned by {uid}:{gid}",
+            path.display()
+        );
+    }
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to restrict {description} {}", path.display()))?;
+    Ok(())
+}
+
+/// Root of the root-owned production session registry tree.
+const PRODUCTION_REGISTRY_ROOT: &str = "/run/wrdp/sesman";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductionSessionScanOperation {
+    ReconcileAfterDaemonRestart,
+    CleanupIdle,
+}
+
+impl ProductionSessionScanOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ReconcileAfterDaemonRestart => "restart reconciliation",
+            Self::CleanupIdle => "idle cleanup",
+        }
+    }
+
+    fn applies_startup_reconciliation(self) -> bool {
+        matches!(self, Self::ReconcileAfterDaemonRestart)
+    }
+
+    fn apply(self, manager: &SessionManager) -> Result<()> {
+        if self.applies_startup_reconciliation() {
+            manager.reconcile_after_daemon_restart()?;
+        } else {
+            // Periodic cleanup must not alter the active connection count. Only
+            // startup reconciliation can recover that count after a daemon exit.
+            let _ = manager.cleanup_idle()?;
+        }
+        Ok(())
+    }
+}
+
+/// Reconcile every production per-user session after a daemon restart.
+pub fn reconcile_production_sessions() -> Result<()> {
+    scan_production_sessions(ProductionSessionScanOperation::ReconcileAfterDaemonRestart)
+}
+
+/// Clean up expired idle production sessions without changing connection state.
+pub fn cleanup_production_sessions() -> Result<()> {
+    scan_production_sessions(ProductionSessionScanOperation::CleanupIdle)
+}
+
+/// Scan root-owned production registries and apply one lifecycle operation.
+///
+/// Nothing under the user-writable `/run/user` tree is trusted. The registry
+/// root, each numeric-UID directory, and each `*.state.json` file must be
+/// root-owned; symlinks are refused (`O_NOFOLLOW`). State is deserialized only
+/// to learn its user, and the manager's re-derived state path must exactly
+/// match the scanned path. Errors for individual entries are logged and do not
+/// prevent processing other users.
+fn scan_production_sessions(operation: ProductionSessionScanOperation) -> Result<()> {
+    let root = Path::new(PRODUCTION_REGISTRY_ROOT);
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", root.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != 0 {
+        bail!(
+            "production registry root {} is not a root-owned directory",
+            root.display()
+        );
+    }
+
+    let entries =
+        fs::read_dir(root).with_context(|| format!("failed to scan {}", root.display()))?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(
+                    "skipping unreadable production registry entry in {} during {}: {error:#}",
+                    root.display(),
+                    operation.name()
+                );
+                continue;
+            }
+        };
+        let dir_path = entry.path();
+        if let Err(error) = scan_production_registry_dir(&dir_path, operation) {
+            warn!(
+                "skipping production session registry {} during {}: {error:#}",
+                dir_path.display(),
+                operation.name()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Scan one numeric-UID directory under the production registry root.
+fn scan_production_registry_dir(
+    dir_path: &Path,
+    operation: ProductionSessionScanOperation,
+) -> Result<()> {
+    let Some(dir_uid) = dir_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.parse::<u32>().ok())
+    else {
+        // Only per-UID directories are production registries; ignore the rest.
+        return Ok(());
+    };
+    let metadata = fs::symlink_metadata(dir_path)
+        .with_context(|| format!("failed to inspect {}", dir_path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != 0 {
+        bail!(
+            "registry {} is not a root-owned directory",
+            dir_path.display()
+        );
+    }
+    let entries =
+        fs::read_dir(dir_path).with_context(|| format!("failed to scan {}", dir_path.display()))?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(
+                    "skipping unreadable production registry entry in {} during {}: {error:#}",
+                    dir_path.display(),
+                    operation.name()
+                );
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if let Err(error) = scan_production_state_file(&path, dir_uid, operation) {
+            warn!(
+                "skipping production session registry {} during {}: {error:#}",
+                path.display(),
+                operation.name()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validate one root-owned state file and apply the requested lifecycle operation.
+fn scan_production_state_file(
+    path: &Path,
+    dir_uid: u32,
+    operation: ProductionSessionScanOperation,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.uid() != 0 {
+        bail!(
+            "state file {} is not a root-owned regular file",
+            path.display()
+        );
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("failed to inspect opened state file {}", path.display()))?;
+    if !opened.is_file() || opened.uid() != 0 {
+        bail!(
+            "state file {} is not a root-owned regular file",
+            path.display()
+        );
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+
+    // Deserialize only to learn the owning user. Every other trusted path is
+    // re-derived from the user's own manager config below, never from the file.
+    let state: SessionState = serde_json::from_str(&content)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    let user = state.user;
+    let resolved_uid =
+        uid_for_user(&user).with_context(|| format!("failed to resolve session user {user}"))?;
+    if resolved_uid != dir_uid {
+        bail!(
+            "registry {} names user {user} (uid {resolved_uid}) but lives under uid {dir_uid}",
+            path.display()
+        );
+    }
+    let config = SesmanConfig::for_user(&user)?;
+    if config.state_path() != path {
+        bail!(
+            "registry {} does not match configured state path {} for user {user}",
+            path.display(),
+            config.state_path().display()
+        );
+    }
+    operation.apply(&SessionManager::new(config))
 }
 
 fn default_true() -> bool {
@@ -742,7 +1189,6 @@ fn default_cleanup_paths() -> Vec<PathBuf> {
     vec![
         runtime.join(MANAGED_WAYLAND_SOCKET),
         runtime.join(MANAGED_WAYLAND_LOCK),
-        runtime.join("wrdp"),
     ]
 }
 
@@ -782,7 +1228,27 @@ mod tests {
         assert_eq!(config.xdg_runtime_dir, expected_root);
         assert_eq!(config.state_dir, expected_root.join("sesman"));
         assert_eq!(config.log_dir, expected_root.join("logs"));
+        assert_eq!(
+            config.cleanup_paths,
+            vec![
+                expected_root.join(MANAGED_WAYLAND_SOCKET),
+                expected_root.join(MANAGED_WAYLAND_LOCK),
+            ]
+        );
         assert!(config.cleanup_globs.is_empty());
+    }
+
+    #[test]
+    fn production_session_scan_cleanup_does_not_reconcile_client_counts() {
+        assert!(
+            ProductionSessionScanOperation::ReconcileAfterDaemonRestart
+                .applies_startup_reconciliation()
+        );
+        assert!(!ProductionSessionScanOperation::CleanupIdle.applies_startup_reconciliation());
+        assert_eq!(
+            ProductionSessionScanOperation::CleanupIdle.name(),
+            "idle cleanup"
+        );
     }
 
     #[test]
@@ -866,7 +1332,10 @@ mod tests {
             config.xdg_runtime_dir,
             PathBuf::from(format!("/run/user/{uid}/wrdp"))
         );
-        assert_eq!(config.state_dir, config.xdg_runtime_dir.join("sesman"));
+        assert_eq!(
+            config.state_dir,
+            PathBuf::from(format!("/run/wrdp/sesman/{uid}"))
+        );
         assert_eq!(config.log_dir, config.xdg_runtime_dir.join("logs"));
         assert!(config.components.iter().all(|component| {
             !component.command.contains("rdp-server")
@@ -947,6 +1416,71 @@ mod tests {
         let state = status.state.expect("state remains after unbind");
         assert_eq!(state.active_clients, 0);
         assert!(state.last_disconnected_at.is_some());
+        assert!(state.idle_deadline_at.is_some());
+    }
+
+    #[test]
+    fn bind_clears_idle_deadline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let current_user = Command::new("id").arg("-un").output().expect("id -un");
+        assert!(current_user.status.success());
+        let user = String::from_utf8(current_user.stdout)
+            .expect("id output utf8")
+            .trim()
+            .to_string();
+
+        let mut child = Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep component");
+
+        let mut config = SesmanConfig::default();
+        config.user = user;
+        config.state_dir = temp.path().join("state");
+        config.log_dir = temp.path().join("logs");
+        config.xdg_runtime_dir = temp.path().join("runtime");
+        config.components = vec![ComponentConfig {
+            name: MANAGED_COMPOSITOR_COMPONENT.to_string(),
+            command: "/bin/sleep".to_string(),
+            args: vec!["60".to_string()],
+            env: BTreeMap::new(),
+            working_dir: None,
+            log_path: None,
+            readiness: ReadinessCheck::ProcessAlive,
+            required: true,
+            startup_delay_ms: 0,
+        }];
+        fs::create_dir_all(&config.state_dir).expect("state dir");
+
+        let manager = SessionManager::new(config.clone());
+        let mut state = SessionState::new(&config);
+        state.active_clients = 0;
+        state.last_disconnected_at = Some(Utc::now());
+        state.idle_deadline_at = Some(Utc::now());
+        let pid = i32::try_from(child.id()).expect("pid fits i32");
+        let identity = capture_identity(pid);
+        state.components.push(ComponentState {
+            name: MANAGED_COMPOSITOR_COMPONENT.to_string(),
+            pid,
+            command: vec!["/bin/sleep".to_string(), "60".to_string()],
+            started_at: Utc::now(),
+            start_ticks: identity.start_ticks,
+            boot_id: identity.boot_id,
+            uid: identity.uid,
+            pgid: identity.pgid,
+            required: true,
+            process_group: false,
+        });
+        manager.write_state(&state).expect("write state");
+
+        let status = manager.bind_single_client().expect("bind");
+        let state = status.state.expect("state after bind");
+        assert_eq!(state.active_clients, 1);
+        assert!(state.last_disconnected_at.is_none());
+        assert!(state.idle_deadline_at.is_none());
+
+        manager.stop().expect("cleanup spawned component");
+        let _ = child.try_wait();
     }
 
     #[test]
@@ -967,6 +1501,53 @@ mod tests {
         let state = status.state.expect("state remains after disconnect");
         assert_eq!(state.active_clients, 0);
         assert!(state.last_disconnected_at.is_some());
+        assert!(state.idle_deadline_at.is_some());
+    }
+
+    #[test]
+    fn reconcile_after_daemon_restart_zeroes_stale_clients_and_sets_deadline() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = SesmanConfig::default();
+        config.state_dir = temp.path().join("state");
+        config.log_dir = temp.path().join("logs");
+        config.xdg_runtime_dir = temp.path().join("runtime");
+        config.idle_timeout_ms = 60_000;
+        fs::create_dir_all(&config.state_dir).expect("state dir");
+
+        let manager = SessionManager::new(config.clone());
+        let mut state = SessionState::new(&config);
+        // A crashed daemon left an active client with no disconnect record.
+        state.active_clients = 3;
+        state.last_disconnected_at = None;
+        state.idle_deadline_at = None;
+        manager.write_state(&state).expect("write state");
+
+        let status = manager.reconcile_after_daemon_restart().expect("reconcile");
+        let state = status.state.expect("state remains after reconcile");
+        assert_eq!(state.active_clients, 0);
+        assert!(state.last_disconnected_at.is_some());
+        assert!(state.idle_deadline_at.is_some());
+    }
+
+    #[test]
+    fn reconcile_after_daemon_restart_stops_overdue_idle_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = SesmanConfig::default();
+        config.state_dir = temp.path().join("state");
+        config.log_dir = temp.path().join("logs");
+        config.xdg_runtime_dir = temp.path().join("runtime");
+        config.idle_timeout_ms = 1;
+        fs::create_dir_all(&config.state_dir).expect("state dir");
+
+        let manager = SessionManager::new(config.clone());
+        let mut state = SessionState::new(&config);
+        state.active_clients = 0;
+        state.last_disconnected_at = Some(Utc::now() - chrono::Duration::milliseconds(50));
+        state.idle_deadline_at = Some(Utc::now() - chrono::Duration::milliseconds(49));
+        manager.write_state(&state).expect("write state");
+
+        let status = manager.reconcile_after_daemon_restart().expect("reconcile");
+        assert_eq!(status.health, SessionHealth::Missing);
     }
 
     #[test]
@@ -1033,12 +1614,17 @@ mod tests {
         let manager = SessionManager::new(config.clone());
         let mut state = SessionState::new(&config);
         state.active_clients = 1;
+        let pid = i32::try_from(child.id()).expect("pid fits i32");
+        let identity = capture_identity(pid);
         state.components.push(ComponentState {
             name: MANAGED_COMPOSITOR_COMPONENT.to_string(),
-            pid: i32::try_from(child.id()).expect("pid fits i32"),
+            pid,
             command: vec!["/bin/sleep".to_string(), "60".to_string()],
             started_at: Utc::now(),
-            start_ticks: None,
+            start_ticks: identity.start_ticks,
+            boot_id: identity.boot_id,
+            uid: identity.uid,
+            pgid: identity.pgid,
             required: true,
             process_group: false,
         });
@@ -1146,6 +1732,9 @@ mod tests {
             command: vec!["/bin/sleep".to_string(), "60".to_string()],
             started_at: Utc::now() - chrono::Duration::minutes(1),
             start_ticks: None,
+            boot_id: None,
+            uid: None,
+            pgid: None,
             required: true,
             process_group: false,
         });
@@ -1193,9 +1782,7 @@ mod tests {
             env: BTreeMap::new(),
             working_dir: None,
             log_path: Some(temp.path().join("logs/wrdp-compositor.log")),
-            readiness: ReadinessCheck::UnixSocket {
-                path: config.xdg_runtime_dir.join(MANAGED_WAYLAND_SOCKET),
-            },
+            readiness: ReadinessCheck::ProcessAlive,
             required: true,
             startup_delay_ms: 0,
         }];
@@ -1209,6 +1796,9 @@ mod tests {
             command: vec!["/bin/false".to_string()],
             started_at: Utc::now(),
             start_ticks: None,
+            boot_id: None,
+            uid: None,
+            pgid: None,
             required: true,
             process_group: false,
         });
@@ -1230,8 +1820,6 @@ mod tests {
         assert_eq!(state.active_clients, 1);
         assert_eq!(state.components.len(), 1);
         assert_ne!(state.components[0].pid, 999_999);
-        assert!(config.xdg_runtime_dir.join(MANAGED_WAYLAND_SOCKET).exists());
-
         manager.stop().expect("cleanup restarted component");
     }
 

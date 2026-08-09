@@ -43,11 +43,14 @@ The production daemon reads `/etc/wrdp/wrdp.ini` by default. `--config PATH`, `-
 At minimum, review:
 
 - `server.listen_addr`; do not expose TCP 3389 beyond intended networks.
+- `server.max_connections`; production currently requires exactly `1`. The serial admission path applies a 30-second pre-authentication deadline.
+- `server.session_timeout`; `0` leaves authenticated sessions unlimited, otherwise the value is the maximum session lifetime in seconds.
+- `server.view_only`; when enabled, WRDP creates no virtual input or clipboard backend and exposes neither input nor CLIPRDR to the client.
 - `security.cert_path` and `security.key_path`.
 - `security.auth_method` (`pam` or `password`).
 - `security.allowed_username`, if the host should accept only one account.
 - clipboard type, size and rate limits.
-- display resize and resolution limits. WRDP applies the negotiated size to the managed output before capture, including on reconnect.
+- display resize and resolution limits. Initial negotiation and later Display Control requests use the same policy. WRDP verifies the realized compositor mode and matching capture frame before publishing a size.
 - EGFX software/hardware encoding policy and `hardware_encoding.vaapi_device`.
 - `video.cursor_mode`; managed sessions normally hide the captured compositor cursor and let the RDP client render its local pointer.
 
@@ -73,7 +76,18 @@ Use a CA-issued certificate in production and distribute the issuing trust chain
 
 PAM is the normal mode and validates the RDP credentials against a local account. Optionally restrict it with `allowed_username`. Static-password mode requires an Argon2id PHC hash for every configured RDP username; plaintext passwords are rejected. NLA/CredSSP and domain authentication are not part of this release.
 
-Run the daemon with the privileges needed to bind the listener, validate PAM users, create per-user runtime directories and drop managed components to their target UID/GID. Do not run the compositor as root.
+Run the daemon with the privileges needed to bind the listener, validate PAM users, create trusted lifecycle state and drop managed components to their target UID/GID. Do not run the compositor as root.
+
+## Runtime and lifecycle state
+
+WRDP deliberately separates user-controlled runtime files from privileged lifecycle authority:
+
+- `/run/user/UID/wrdp` is owned by the managed account and contains the Wayland socket and component logs.
+- `/run/wrdp/sesman/UID` is owned by the daemon identity and contains the session state and kernel advisory lock.
+
+Do not change ownership of `/run/wrdp/sesman` or copy state files into it from user-owned paths. WRDP ignores legacy `/run/user/UID/wrdp/sesman` registries and never uses them to signal processes. On first start after this change, existing managed compositor processes from an older build may need to be stopped manually before reconnecting.
+
+At daemon startup, trusted registries are reconciled after an interrupted connection. Idle deadlines are persisted, and a periodic scanner stops overdue idle sessions without altering live client counts.
 
 ## systemd socket activation
 
@@ -119,7 +133,7 @@ sudo systemctl enable --now wrdp.socket
 sudo systemctl status wrdp.socket wrdp.service
 ```
 
-Do not set both a systemd socket and an unrelated process to the same address. WRDP verifies that the activated socket matches `server.listen_addr`.
+Do not set both a systemd socket and an unrelated process to the same address. WRDP requires the activated descriptor to be a listening TCP socket whose complete address and IP family exactly match `server.listen_addr`; mismatch is a startup error.
 
 ## Packaging contract
 
@@ -141,10 +155,12 @@ Before upgrading:
 1. Record `wrdp --version` and the package/source revision.
 2. Back up `/etc/wrdp`, including certificate metadata but protect private keys.
 3. Stop `wrdp.socket` to prevent new connections, then stop `wrdp.service`.
-4. Install the daemon and bundled compositor atomically from the same release.
-5. Run `wrdp --diagnose`, then start the socket and test one new and one reconnecting session.
+4. Stop existing managed sessions with `wrdpctl`; older user-owned state is intentionally not imported into the trusted registry.
+5. Install the daemon and bundled compositor atomically from the same release.
+6. Verify `/run/wrdp` is root-owned and not writable by managed users.
+7. Run `wrdp --diagnose`, then start the socket and test a new session, resize, disconnect and reconnect.
 
-Configuration additions have defaults, but removed or renamed settings should be reviewed against release notes. For rollback, restore the previous binaries and matching compositor, restore the prior configuration, run diagnostics, and restart the socket. Per-user session state is operational state, not a migration database; stop stale sessions with `wrdpctl` if a downgrade cannot reuse them safely.
+Configuration additions have defaults, but `server.max_connections` must be `1`; review any previous higher value before restart. For rollback, stop the socket and service, stop managed sessions, remove only the temporary root-owned `/run/wrdp/sesman` registry, restore the previous binaries, matching compositor and configuration, run diagnostics, then restart the socket. Never move new root-owned state into an older user-owned registry or vice versa. Session state is operational state, not a migration database.
 
 ## Troubleshooting
 
@@ -166,10 +182,12 @@ Common failures:
 - **Hardware encoder unavailable:** verify `/dev/dri/renderD*`, VA driver packages and service permissions. Confirm the journal reports DMA-BUF capture and VA-API encoder creation; WRDP falls back to software only when configured to do so.
 - **Clipboard unavailable:** verify the managed compositor exposes data-control and review clipboard policy limits.
 - **Audio unavailable:** verify the managed user runtime has a PipeWire socket and inspect RDPSND format negotiation.
-- **Cropped desktop after reconnect:** compare the client-requested size, `wlr-randr`, capture geometry and input mapping. They must match; repeated `Cropped source frame` messages indicate a failed output resize rather than normal operation.
+- **Resize fails or remains at the prior size:** compare the requested policy, target-user `wlr-randr` result and capture geometry. WRDP keeps the last committed size until an exact matching frame arrives; repeated realization timeouts point to compositor or capture failure.
 - **Pointer drift or duplicate clicks:** compare RDP and stream geometry, and confirm Advanced Input became the sole mouse path. The managed capture must not embed a second cursor.
 - **Resize ignored:** check `display.allow_resize`, `allowed_resolutions`, the maximum display area and `wlr-randr` access to the managed Wayland socket.
 - **Theme missing:** verify `/etc/wrdp/labwc/rc.xml` selects `PlatinumTheme-wrdp-compositor`, the theme exists under `/usr/share/themes`, and the compositor log has no XML parser errors.
-- **Stale session:** inspect with `wrdpctl`, stop it cleanly, and verify `/run/user/UID/wrdp` ownership before reconnecting.
+- **Stale session:** inspect with `wrdpctl`, stop it cleanly, verify `/run/user/UID/wrdp` belongs to the account, and verify `/run/wrdp/sesman/UID` belongs to root. User-owned legacy state directories are ignored.
+- **View-only session accepts input:** verify the daemon loaded the intended configuration and journaled view-only policy. A compliant build creates no input or clipboard backend for that connection.
+- **Connection closes after 30 seconds:** if authentication never completed, inspect TLS/PAM latency and client handshake logs. Authenticated session lifetime is controlled separately by `server.session_timeout`.
 
 When reporting a defect, include the exact revision, client name/version, sanitized configuration, diagnostics and relevant journal lines. Never include passwords, private keys, PAM data or clipboard contents.

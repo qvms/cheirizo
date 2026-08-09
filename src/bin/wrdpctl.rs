@@ -114,19 +114,26 @@ fn manager_for_user(user: &str) -> Result<SessionManager> {
 }
 
 fn discover_sessions() -> Result<Vec<DiscoveredSession>> {
+    discover_sessions_in(Path::new("/run/wrdp/sesman"))
+}
+
+/// Discover sessions under a root-owned registry root.
+///
+/// Only the root-owned production registry `/run/wrdp/sesman/<uid>` tree is
+/// trusted; the legacy `/run/user/<uid>/wrdp/sesman` location is ignored. Each
+/// numeric-UID directory and its `*.state.json` files must be regular,
+/// non-symlink, and owned by the effective UID running this tool (root in
+/// production), and the user named by the state must resolve back to the
+/// directory's UID. The registry root is a parameter so the scan can be
+/// exercised against a temporary tree in tests.
+fn discover_sessions_in(registry_root: &Path) -> Result<Vec<DiscoveredSession>> {
     let mut sessions = Vec::new();
-    let run_user = Path::new("/run/user");
-    let Ok(entries) = fs::read_dir(run_user) else {
+    let euid = nix::unistd::Uid::effective().as_raw();
+    let Ok(entries) = fs::read_dir(registry_root) else {
         return Ok(sessions);
     };
 
     for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
         let Some(uid) = entry
             .file_name()
             .to_str()
@@ -134,8 +141,17 @@ fn discover_sessions() -> Result<Vec<DiscoveredSession>> {
         else {
             continue;
         };
-        let state_dir = entry.path().join("wrdp/sesman");
-        let Ok(state_entries) = fs::read_dir(&state_dir) else {
+        let dir_path = entry.path();
+        let Ok(dir_metadata) = fs::symlink_metadata(&dir_path) else {
+            continue;
+        };
+        if dir_metadata.file_type().is_symlink()
+            || !dir_metadata.is_dir()
+            || dir_metadata.uid() != euid
+        {
+            continue;
+        }
+        let Ok(state_entries) = fs::read_dir(&dir_path) else {
             continue;
         };
         for state_entry in state_entries.flatten() {
@@ -145,7 +161,10 @@ fn discover_sessions() -> Result<Vec<DiscoveredSession>> {
             }
             let metadata = fs::symlink_metadata(&path)
                 .with_context(|| format!("failed to stat {}", path.display()))?;
-            if !metadata.file_type().is_file() || metadata.uid() != uid {
+            if metadata.file_type().is_symlink()
+                || !metadata.file_type().is_file()
+                || metadata.uid() != euid
+            {
                 continue;
             }
             let Ok(bytes) = fs::read(&path) else {
@@ -431,4 +450,30 @@ where
         println!("{value:#?}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_ignores_non_numeric_and_unresolvable_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        // A non-numeric directory is not a per-UID registry and is ignored.
+        fs::create_dir(root.join("not-a-uid")).expect("create non-numeric dir");
+        // A numeric directory owned by the test process, but the state names an
+        // unresolvable user (and is not a complete SessionState), so the entry
+        // is skipped rather than reported.
+        let uid_dir = root.join("4000000000");
+        fs::create_dir(&uid_dir).expect("create uid dir");
+        fs::write(
+            uid_dir.join("default.state.json"),
+            r#"{"user":"wrdp-nonexistent-user-xyz"}"#,
+        )
+        .expect("write state");
+
+        let sessions = discover_sessions_in(root).expect("discover");
+        assert!(sessions.is_empty());
+    }
 }

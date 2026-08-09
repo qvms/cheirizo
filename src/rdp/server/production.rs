@@ -1,6 +1,18 @@
 //! Production RDP listener and per-user connection binding.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    fs,
+    future::Future,
+    io,
+    net::SocketAddr,
+    os::unix::fs::{FileTypeExt, MetadataExt},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -9,7 +21,8 @@ use ironrdp_server::{
     BoundConnection, ConnectionBinder, Credentials, DesktopSize, DisplayUpdate, KeyboardEvent,
     MouseEvent, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler,
 };
-use tokio::sync::{Mutex, RwLock, broadcast};
+use nix::sys::socket::{getsockopt, sockopt};
+use tokio::sync::{Mutex, Notify, RwLock, broadcast};
 use tracing::{info, warn};
 
 trait PeerAwareValidator: Send + Sync {
@@ -37,11 +50,20 @@ impl PeerAwareValidator for crate::security::StaticPasswordValidator {
 
 use crate::{
     config::Config,
-    rdp::channels::{
-        audio::{AudioTarget, WrdpSoundFactory},
-        clipboard::{ClipboardOrchestrator, ClipboardOrchestratorConfig, WrdpCliprdrFactory},
+    rdp::{
+        channels::{
+            audio::{AudioTarget, WrdpSoundFactory},
+            clipboard::{ClipboardOrchestrator, ClipboardOrchestratorConfig, WrdpCliprdrFactory},
+        },
+        server::{
+            DisplayChannelHandler, EgfxChannelFactory, InputChannelHandler,
+            display_handler::ManagedCompositorControl,
+        },
+        session::supervision::{
+            OverallStatus, SessionStatus, SessionStatusEvent, SessionStatusSubscriber,
+            SessionSupervisor,
+        },
     },
-    rdp::server::{DisplayChannelHandler, EgfxChannelFactory, InputChannelHandler},
 };
 
 fn effective_codec_policy(
@@ -55,8 +77,215 @@ fn effective_codec_policy(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProductionChannelPolicy {
+    clipboard: bool,
+    input: bool,
+}
+
+fn production_channel_policy(config: &Config) -> ProductionChannelPolicy {
+    ProductionChannelPolicy {
+        clipboard: config.clipboard.enabled && !config.server.view_only,
+        input: !config.server.view_only,
+    }
+}
+
+const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const SUPERVISION_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const PRODUCTION_IDLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const PRODUCTION_DEFAULT_DESKTOP_SIZE: DesktopSize = DesktopSize {
+    width: 1920,
+    height: 1080,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionTimeoutPhase {
+    PreAuth,
+    Session,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedConnectionTimeout {
+    deadline: tokio::time::Instant,
+    phase: ConnectionTimeoutPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionCancellation {
+    Timeout(ConnectionTimeoutPhase),
+    SessionInvalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancellationDecision {
+    Cancel,
+    DeferUntilAdmissionFinishes,
+}
+
+fn cancellation_decision(
+    admission_started: bool,
+    admission_finished: bool,
+) -> CancellationDecision {
+    if admission_started && !admission_finished {
+        CancellationDecision::DeferUntilAdmissionFinishes
+    } else {
+        CancellationDecision::Cancel
+    }
+}
+
+struct AdmissionFinishedGuard {
+    finished: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl AdmissionFinishedGuard {
+    fn new(finished: Arc<AtomicBool>, notify: Arc<Notify>) -> Self {
+        Self { finished, notify }
+    }
+}
+
+impl Drop for AdmissionFinishedGuard {
+    fn drop(&mut self) {
+        self.finished.store(true, Ordering::Release);
+        self.notify.notify_one();
+    }
+}
+
+fn selected_connection_timeout(
+    started: tokio::time::Instant,
+    admission_started: bool,
+    session_timeout: Option<Duration>,
+) -> Option<SelectedConnectionTimeout> {
+    let session = session_timeout.map(|timeout| SelectedConnectionTimeout {
+        deadline: started + timeout,
+        phase: ConnectionTimeoutPhase::Session,
+    });
+    if admission_started {
+        return session;
+    }
+
+    let pre_auth = SelectedConnectionTimeout {
+        deadline: started + PRE_AUTH_TIMEOUT,
+        phase: ConnectionTimeoutPhase::PreAuth,
+    };
+    match session {
+        Some(session) if session.deadline <= pre_auth.deadline => Some(session),
+        _ => Some(pre_auth),
+    }
+}
+
+async fn run_with_connection_timeouts<F>(
+    connection: F,
+    admission_started: Arc<AtomicBool>,
+    admission_started_notify: Arc<Notify>,
+    admission_finished: Arc<AtomicBool>,
+    admission_finished_notify: Arc<Notify>,
+    connection_invalid: Arc<Notify>,
+    session_timeout: Option<Duration>,
+) -> std::result::Result<F::Output, ConnectionCancellation>
+where
+    F: Future,
+{
+    let started = tokio::time::Instant::now();
+    let mut pending_cancellation = None;
+    tokio::pin!(connection);
+
+    loop {
+        let admitted = admission_started.load(Ordering::Acquire);
+        let finished = admission_finished.load(Ordering::Acquire);
+
+        if let Some(cancellation) = pending_cancellation
+            && cancellation_decision(admitted, finished) == CancellationDecision::Cancel
+        {
+            // Poll once after the binder's guard completed. This lets the same
+            // connection future consume the binder result before cancellation,
+            // so any committed resources are visible to common cleanup.
+            tokio::select! {
+                biased;
+                result = &mut connection => return Ok(result),
+                () = std::future::ready(()) => return Err(cancellation),
+            }
+        }
+
+        let timeout = pending_cancellation
+            .is_none()
+            .then(|| selected_connection_timeout(started, admitted, session_timeout))
+            .flatten();
+        let timeout_wait = async {
+            match timeout {
+                Some(timeout) => tokio::time::sleep_until(timeout.deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+
+        tokio::select! {
+            biased;
+            result = &mut connection => return Ok(result),
+            () = admission_started_notify.notified(), if !admitted => {}
+            () = admission_finished_notify.notified(),
+                if pending_cancellation.is_some() && !finished => {}
+            () = connection_invalid.notified(), if pending_cancellation.is_none() => {
+                let cancellation = ConnectionCancellation::SessionInvalid;
+                if cancellation_decision(
+                    admission_started.load(Ordering::Acquire),
+                    admission_finished.load(Ordering::Acquire),
+                ) == CancellationDecision::DeferUntilAdmissionFinishes
+                {
+                    pending_cancellation = Some(cancellation);
+                } else {
+                    return Err(cancellation);
+                }
+            }
+            () = timeout_wait, if timeout.is_some() => {
+                let cancellation = ConnectionCancellation::Timeout(
+                    timeout.expect("timeout branch requires a deadline").phase,
+                );
+                if cancellation_decision(
+                    admission_started.load(Ordering::Acquire),
+                    admission_finished.load(Ordering::Acquire),
+                ) == CancellationDecision::DeferUntilAdmissionFinishes
+                {
+                    pending_cancellation = Some(cancellation);
+                } else {
+                    return Err(cancellation);
+                }
+            }
+        }
+    }
+}
+
+fn is_recoverable_accept_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+    ) {
+        return true;
+    }
+
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
+fn accept_retry_delay(consecutive_errors: u32) -> Duration {
+    let shift = consecutive_errors.saturating_sub(1).min(7);
+    Duration::from_millis((10_u64 << shift).min(MAX_ACCEPT_RETRY_DELAY.as_millis() as u64))
+}
+
 pub async fn run(config: Config) -> Result<()> {
     info!("starting wrdp production single-daemon listener");
+
+    tokio::task::spawn_blocking(crate::sesman::reconcile_production_sessions)
+        .await
+        .context("production sesman reconciliation task panicked")??;
+    info!("production sesman restart reconciliation complete");
+    spawn_production_idle_cleanup();
 
     let tls_config = crate::security::TlsConfig::from_files_with_options(
         &config.security.cert_path,
@@ -79,7 +308,10 @@ pub async fn run(config: Config) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to create bitmap codec capabilities: {e}"))?;
 
     let active_bound_user = Arc::new(Mutex::new(None));
-    let active_display = Arc::new(Mutex::new(None));
+    let active_connection = Arc::new(Mutex::new(None));
+    let active_connection_cancel: Arc<StdMutex<Option<Arc<Notify>>>> =
+        Arc::new(StdMutex::new(None));
+    let fatal_shutdown_error: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
     let audio_target = AudioTarget::default();
 
     let configured_codec_policy = crate::rdp::server::EgfxCodecPolicy::parse(&config.egfx.codec)
@@ -124,7 +356,8 @@ pub async fn run(config: Config) -> Result<()> {
             (None, None, None)
         };
 
-    let clipboard_manager = if config.clipboard.enabled {
+    let channel_policy = production_channel_policy(&config);
+    let clipboard_manager = if channel_policy.clipboard {
         let all_allowed = config.clipboard.allowed_types.is_empty();
         let has_type = |patterns: &[&str]| {
             all_allowed
@@ -169,10 +402,7 @@ pub async fn run(config: Config) -> Result<()> {
         // Preserve the desktop requested during initial capability exchange.
         // Without this, a later correction emits an avoidable Deactivate-All
         // cycle before the first graphics surface is usable.
-        .with_honor_client_desktop_size(Some(DesktopSize {
-            width: 1920,
-            height: 1080,
-        }))
+        .with_honor_client_desktop_size(Some(PRODUCTION_DEFAULT_DESKTOP_SIZE))
         .with_cliprdr_factory(cliprdr_factory)
         .with_gfx_factory(gfx_factory)
         .with_sound_factory(Some(Box::new(WrdpSoundFactory::new(audio_target.clone()))))
@@ -209,42 +439,128 @@ pub async fn run(config: Config) -> Result<()> {
         }
     }
 
+    let admission_started = Arc::new(AtomicBool::new(false));
+    let admission_started_notify = Arc::new(Notify::new());
+    let admission_finished = Arc::new(AtomicBool::new(false));
+    let admission_finished_notify = Arc::new(Notify::new());
     rdp_server.set_connection_binder(Some(Arc::new(ProductionSesmanBinder {
         active_bound_user: Arc::clone(&active_bound_user),
-        active_display: Arc::clone(&active_display),
+        active_connection: Arc::clone(&active_connection),
+        active_connection_cancel: Arc::clone(&active_connection_cancel),
+        fatal_shutdown_error: Arc::clone(&fatal_shutdown_error),
         audio_target: audio_target.clone(),
         config: Arc::new(config.clone()),
         server_event_tx: rdp_server.event_sender().clone(),
         clipboard_manager: clipboard_manager.clone(),
         gfx_server_handle,
         gfx_handler_state,
+        admission_started: Arc::clone(&admission_started),
+        admission_started_notify: Arc::clone(&admission_started_notify),
+        admission_finished: Arc::clone(&admission_finished),
+        admission_finished_notify: Arc::clone(&admission_finished_notify),
     })));
 
+    let session_timeout = (config.server.session_timeout != 0)
+        .then(|| Duration::from_secs(config.server.session_timeout));
     let listener = production_listener(listen_addr)?;
     info!(
         "wrdp production listener ready on {}",
         listener.local_addr()?
     );
 
+    let mut consecutive_accept_errors = 0_u32;
     loop {
-        let (stream, peer) = listener
-            .accept()
-            .await
-            .context("failed to accept RDP client")?;
+        let (stream, peer) = loop {
+            match listener.accept().await {
+                Ok(accepted) => {
+                    consecutive_accept_errors = 0;
+                    break accepted;
+                }
+                Err(error) if is_recoverable_accept_error(&error) => {
+                    consecutive_accept_errors = consecutive_accept_errors.saturating_add(1);
+                    let delay = accept_retry_delay(consecutive_accept_errors);
+                    warn!(
+                        error = %error,
+                        retry_delay_ms = delay.as_millis(),
+                        "recoverable RDP listener accept error; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error).context("failed to accept RDP client"),
+            }
+        };
+
         info!("accepted RDP client connection");
         if let Some(validator) = peer_validator.as_ref() {
             validator.set_peer_ip(peer.ip());
             validator.prune_stale_entries();
         }
-        let result = rdp_server.run_connection(stream).await;
+
+        admission_finished.store(false, Ordering::Release);
+        admission_started.store(false, Ordering::Release);
+        let connection_invalid = Arc::new(Notify::new());
+        *active_connection_cancel
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active connection cancellation lock poisoned"))? =
+            Some(Arc::clone(&connection_invalid));
+
+        let connection = rdp_server.run_connection(stream);
+        let result = match run_with_connection_timeouts(
+            connection,
+            Arc::clone(&admission_started),
+            Arc::clone(&admission_started_notify),
+            Arc::clone(&admission_finished),
+            Arc::clone(&admission_finished_notify),
+            Arc::clone(&connection_invalid),
+            session_timeout,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(ConnectionCancellation::Timeout(ConnectionTimeoutPhase::PreAuth)) => Err(
+                anyhow::anyhow!("RDP pre-authentication timed out after 30 seconds"),
+            ),
+            Err(ConnectionCancellation::Timeout(ConnectionTimeoutPhase::Session)) => {
+                Err(anyhow::anyhow!(
+                    "RDP session timed out after {} seconds",
+                    config.server.session_timeout
+                ))
+            }
+            Err(ConnectionCancellation::SessionInvalid) => {
+                Err(anyhow::anyhow!("production session became invalid"))
+            }
+        };
+        {
+            let mut active_cancel = active_connection_cancel
+                .lock()
+                .map_err(|_| anyhow::anyhow!("active connection cancellation lock poisoned"))?;
+            if active_cancel
+                .as_ref()
+                .is_some_and(|active| Arc::ptr_eq(active, &connection_invalid))
+            {
+                *active_cancel = None;
+            }
+        }
         if let Err(e) = &result {
             warn!("RDP client connection ended with error: {e:#}");
         } else {
             info!("RDP client connection ended cleanly");
         }
+        if let Some(error) = fatal_shutdown_error
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fatal shutdown error latch poisoned"))?
+            .take()
+        {
+            anyhow::bail!("fatal production connection shutdown failure: {error}");
+        }
 
-        if let Some(display) = active_display.lock().await.take() {
-            display.release_connection_resources().await;
+        // Keep cleanup common to clean disconnects, protocol failures, and
+        // connection futures dropped by timeout or invalid-session cancellation.
+        if let Some(connection) = active_connection.lock().await.take() {
+            connection
+                .shutdown()
+                .await
+                .context("failed to shut down production connection resources")?;
         }
         audio_target.clear();
         if let Some(manager) = clipboard_manager.as_ref() {
@@ -254,6 +570,20 @@ pub async fn run(config: Config) -> Result<()> {
             record_production_disconnect(user).await;
         }
     }
+}
+
+/// Run daemon-wide cleanup independently of individual RDP connections.
+fn spawn_production_idle_cleanup() {
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(PRODUCTION_IDLE_CLEANUP_INTERVAL).await;
+            match tokio::task::spawn_blocking(crate::sesman::cleanup_production_sessions).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!("periodic production idle cleanup failed: {error:#}"),
+                Err(error) => warn!("periodic production idle cleanup task panicked: {error:#}"),
+            }
+        }
+    });
 }
 
 fn production_listener(listen_addr: SocketAddr) -> Result<tokio::net::TcpListener> {
@@ -277,23 +607,36 @@ fn adopt_systemd_listener(expected_addr: SocketAddr) -> Result<Option<tokio::net
         return Ok(None);
     };
 
+    validate_systemd_listener_accepts_connections(&std_listener)?;
     std_listener
         .set_nonblocking(true)
         .context("failed to set systemd listener nonblocking")?;
     let actual_addr = std_listener
         .local_addr()
         .context("systemd fd is not a TCP listener")?;
-    if actual_addr.port() != expected_addr.port() {
-        warn!(
-            "systemd listener is {}, config listen_addr is {}; using systemd listener",
-            actual_addr, expected_addr
-        );
-    } else {
-        info!("adopted systemd listener {}", actual_addr);
-    }
+    validate_systemd_listener_addr(expected_addr, actual_addr)?;
+    info!("adopted systemd listener {}", actual_addr);
     tokio::net::TcpListener::from_std(std_listener)
         .map(Some)
         .context("failed to adopt systemd listener")
+}
+
+fn validate_systemd_listener_accepts_connections<F: std::os::fd::AsFd>(socket: &F) -> Result<()> {
+    if !getsockopt(socket, sockopt::AcceptConn)
+        .context("failed to query SO_ACCEPTCONN on systemd socket activation fd")?
+    {
+        anyhow::bail!("systemd socket activation fd is not accepting connections");
+    }
+    Ok(())
+}
+
+fn validate_systemd_listener_addr(expected: SocketAddr, actual: SocketAddr) -> Result<()> {
+    if actual != expected {
+        anyhow::bail!(
+            "systemd listener address mismatch: expected exact configured address {expected}, got {actual} (address and IP family must match)"
+        );
+    }
+    Ok(())
 }
 
 async fn record_production_disconnect(user: String) {
@@ -337,15 +680,172 @@ async fn record_production_disconnect(user: String) {
     }
 }
 
+/// Roll back the session state after `ensure` succeeded but RDP binding did not.
+///
+/// A reused session remains available for its configured idle period.  A newly
+/// created session has no successful client owner and is stopped immediately.
+async fn rollback_ensured_production_session(user: String, reused_existing: bool) {
+    if reused_existing {
+        match tokio::task::spawn_blocking(move || {
+            let config = crate::sesman::SesmanConfig::for_user(&user)?;
+            let idle_timeout_ms = config.idle_timeout_ms;
+            let status = crate::sesman::SessionManager::new(config).unbind_single_client()?;
+            Ok::<_, anyhow::Error>((user, status, idle_timeout_ms))
+        })
+        .await
+        {
+            Ok(Ok((user, status, idle_timeout_ms))) => {
+                info!(
+                    "left reused production session idle after failed RDP bind (health={:?})",
+                    status.health
+                );
+                if idle_timeout_ms > 0 {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(idle_timeout_ms)).await;
+                        let cleanup_user = user.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            let config = crate::sesman::SesmanConfig::for_user(&cleanup_user)?;
+                            crate::sesman::SessionManager::new(config).cleanup_idle()
+                        })
+                        .await
+                        {
+                            Ok(Ok(true)) => {
+                                info!("stopped idle reused production session after failed bind")
+                            }
+                            Ok(Ok(false)) => {}
+                            Ok(Err(error)) => warn!(
+                                "failed delayed cleanup of reused production session: {error:#}"
+                            ),
+                            Err(error) => warn!(
+                                "delayed reused production-session cleanup task panicked: {error:#}"
+                            ),
+                        }
+                    });
+                }
+            }
+            Ok(Err(error)) => warn!("failed to mark reused production session idle: {error:#}"),
+            Err(error) => warn!("reused production-session rollback task panicked: {error:#}"),
+        }
+        return;
+    }
+
+    match tokio::task::spawn_blocking(move || {
+        let config = crate::sesman::SesmanConfig::for_user(&user)?;
+        crate::sesman::SessionManager::new(config).stop()
+    })
+    .await
+    {
+        Ok(Ok(status)) => info!(
+            "stopped newly created production session after failed RDP bind (health={:?})",
+            status.health
+        ),
+        Ok(Err(error)) => warn!("failed to stop newly created production session: {error:#}"),
+        Err(error) => warn!("new production-session rollback task panicked: {error:#}"),
+    }
+}
+
+async fn watch_production_session_health(
+    mut subscriber: SessionStatusSubscriber,
+    connection_invalid: Arc<Notify>,
+) {
+    while subscriber.changed().await.is_ok() {
+        let status = subscriber.current();
+        let Some(reason) = invalid_session_reason(&status) else {
+            continue;
+        };
+
+        warn!(%reason, "production session became invalid; disconnecting RDP client");
+        connection_invalid.notify_one();
+        break;
+    }
+}
+
+fn invalid_session_reason(status: &SessionStatus) -> Option<String> {
+    (status.overall == OverallStatus::Invalid).then(|| {
+        format!(
+            "production session invalid: session={}, graphics={}, input={}, clipboard={}",
+            status.session, status.graphics, status.input, status.clipboard
+        )
+    })
+}
+
+fn retain_fatal_shutdown_error(latch: &StdMutex<Option<String>>, error: &anyhow::Error) {
+    let mut latch = latch
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if latch.is_none() {
+        *latch = Some(format!("{error:#}"));
+    }
+}
+
+async fn await_supervision_task(name: &'static str, mut handle: tokio::task::JoinHandle<()>) {
+    match tokio::time::timeout(SUPERVISION_TASK_SHUTDOWN_TIMEOUT, &mut handle).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if error.is_cancelled() => {}
+        Ok(Err(error)) => warn!(task = name, %error, "production supervision task failed"),
+        Err(_) => {
+            warn!(
+                task = name,
+                "production supervision task did not stop; aborting"
+            );
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+struct ProductionConnectionResources {
+    display: Arc<DisplayChannelHandler>,
+    session_handle: Arc<dyn crate::rdp::session::SessionHandle>,
+    connection_invalid: Arc<Notify>,
+    supervision_shutdown: broadcast::Sender<()>,
+    monitor_handle: tokio::task::JoinHandle<()>,
+    watcher_handle: tokio::task::JoinHandle<()>,
+}
+
+impl ProductionConnectionResources {
+    async fn shutdown(self) -> Result<()> {
+        let Self {
+            display,
+            session_handle,
+            connection_invalid: _connection_invalid,
+            supervision_shutdown,
+            monitor_handle,
+            watcher_handle,
+        } = self;
+
+        // The session backend reports SessionClosed during intentional teardown.
+        // Cancel the invalid-health watcher first; its generation token must not
+        // request cancellation after this connection starts shutting down.
+        watcher_handle.abort();
+        display.release_connection_resources().await;
+        let shutdown_result = session_handle.shutdown().await;
+        let _ = supervision_shutdown.send(());
+
+        tokio::join!(
+            await_supervision_task("monitor", monitor_handle),
+            await_supervision_task("watcher", watcher_handle),
+        );
+
+        shutdown_result.context("session backend shutdown failed")
+    }
+}
+
 struct ProductionSesmanBinder {
     active_bound_user: Arc<Mutex<Option<String>>>,
-    active_display: Arc<Mutex<Option<Arc<DisplayChannelHandler>>>>,
+    active_connection: Arc<Mutex<Option<ProductionConnectionResources>>>,
+    active_connection_cancel: Arc<StdMutex<Option<Arc<Notify>>>>,
+    fatal_shutdown_error: Arc<StdMutex<Option<String>>>,
     audio_target: AudioTarget,
     config: Arc<Config>,
     server_event_tx: tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
     clipboard_manager: Option<Arc<Mutex<ClipboardOrchestrator>>>,
     gfx_server_handle: Option<Arc<RwLock<Option<ironrdp_server::GfxServerHandle>>>>,
     gfx_handler_state: Option<Arc<RwLock<Option<crate::rdp::server::HandlerState>>>>,
+    admission_started: Arc<AtomicBool>,
+    admission_started_notify: Arc<Notify>,
+    admission_finished: Arc<AtomicBool>,
+    admission_finished_notify: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
@@ -355,10 +855,36 @@ impl ConnectionBinder for ProductionSesmanBinder {
         credentials: &Credentials,
         desktop_size: DesktopSize,
     ) -> Result<BoundConnection> {
+        self.admission_finished.store(false, Ordering::Release);
+        self.admission_started.store(true, Ordering::Release);
+        let _admission_finished_guard = AdmissionFinishedGuard::new(
+            Arc::clone(&self.admission_finished),
+            Arc::clone(&self.admission_finished_notify),
+        );
+        self.admission_started_notify.notify_one();
+
+        let connection_invalid = self
+            .active_connection_cancel
+            .lock()
+            .map_err(|_| anyhow::anyhow!("active connection cancellation lock poisoned"))?
+            .clone()
+            .context("no cancellation generation for active RDP connection")?;
+
+        // The initial desktop size is part of session creation, not a later
+        // display-control request.  Reject it before `ensure`: after a managed
+        // compositor is started the binder cannot renegotiate RDP capabilities.
+        let desktop_size = DisplayChannelHandler::validate_geometry_policy(
+            &self.config,
+            desktop_size,
+            Some(PRODUCTION_DEFAULT_DESKTOP_SIZE),
+        )
+        .context("initial RDP desktop geometry violates production policy")?;
+
         let username = normalize_local_account_name(&credentials.username);
         let active_bound_user = Arc::clone(&self.active_bound_user);
-        let active_display = Arc::clone(&self.active_display);
+        let active_connection = Arc::clone(&self.active_connection);
         let audio_target = self.audio_target.clone();
+        let fatal_shutdown_error = Arc::clone(&self.fatal_shutdown_error);
         let config = Arc::clone(&self.config);
         let server_event_tx = self.server_event_tx.clone();
         let clipboard_manager = self.clipboard_manager.clone();
@@ -381,36 +907,64 @@ impl ConnectionBinder for ProductionSesmanBinder {
         })
         .await
         .context("sesman ensure task panicked")??;
+        let reused_existing = ensure_result.reused_existing;
 
-        let state = ensure_result
-            .status
-            .state
-            .as_ref()
-            .context("sesman ensure completed without persisted session state")?;
+        let runtime_dir = match ensure_result.status.state.as_ref() {
+            Some(state) => state.xdg_runtime_dir.clone(),
+            None => {
+                rollback_ensured_production_session(username.clone(), reused_existing).await;
+                anyhow::bail!("sesman ensure completed without persisted session state");
+            }
+        };
+        let wayland_socket = runtime_dir.join("wayland-0");
 
-        // The compositor may be reused across clients and therefore retain a
-        // previous output mode. Apply the negotiated desktop size before the
-        // capture session is created so capture, encoding, and input all share
-        // one geometry. Cropping is only a transient safety fallback.
-        resize_production_compositor(&state.xdg_runtime_dir.join("wayland-0"), desktop_size)
-            .await
-            .context("failed to apply negotiated desktop size to managed compositor")?;
+        let identity_user = username.clone();
+        let target_user =
+            match tokio::task::spawn_blocking(move || resolve_target_user_identity(&identity_user))
+                .await
+            {
+                Ok(Ok(identity)) => identity,
+                Ok(Err(error)) => {
+                    rollback_ensured_production_session(username.clone(), reused_existing).await;
+                    return Err(error).context("failed to resolve managed session identity");
+                }
+                Err(error) => {
+                    rollback_ensured_production_session(username.clone(), reused_existing).await;
+                    return Err(error).context("managed session identity task panicked");
+                }
+            };
 
-        let (bound, display) = match build_production_portal_generic_connection(
+        // A reused compositor can retain an earlier mode.  Apply and verify the
+        // negotiated geometry before capture is created so capture, input, and
+        // RDP all use the same size.
+        if let Err(error) =
+            resize_production_compositor(&wayland_socket, desktop_size, &target_user).await
+        {
+            rollback_ensured_production_session(username.clone(), reused_existing).await;
+            return Err(error)
+                .context("failed to apply negotiated desktop size to managed compositor");
+        }
+
+        let (bound, resources) = match build_production_portal_generic_connection(
             &username,
-            state.xdg_runtime_dir.join("wayland-0"),
+            wayland_socket,
+            &target_user,
             config,
             server_event_tx,
+            connection_invalid,
             clipboard_manager,
             gfx_server_handle,
             gfx_handler_state,
             desktop_size,
+            Arc::clone(&fatal_shutdown_error),
         )
         .await
         {
             Ok(bound) => bound,
             Err(error) => {
-                record_production_disconnect(username.clone()).await;
+                // The builder explicitly shuts down its portal session before
+                // returning an error, including any partial local resources.
+                rollback_ensured_production_session(username.clone(), reused_existing).await;
                 return Err(error).with_context(|| {
                     format!("failed to bind production RDP handlers for user '{username}'")
                 });
@@ -426,53 +980,302 @@ impl ConnectionBinder for ProductionSesmanBinder {
         match bind_result {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
-                record_production_disconnect(username.clone()).await;
-                return Err(error).context("failed to record bound production client");
+                let bind_error = error.context("failed to record bound production client");
+                if let Err(shutdown_error) = resources.shutdown().await {
+                    let shutdown_error = shutdown_error.context(format!(
+                        "production resource shutdown failed before rollback after client-bind failure: {bind_error:#}"
+                    ));
+                    retain_fatal_shutdown_error(&fatal_shutdown_error, &shutdown_error);
+                    return Err(shutdown_error);
+                }
+                rollback_ensured_production_session(username.clone(), reused_existing).await;
+                return Err(bind_error);
             }
             Err(error) => {
-                record_production_disconnect(username.clone()).await;
-                return Err(error).context("sesman client-bind task panicked");
+                let bind_error =
+                    anyhow::Error::new(error).context("sesman client-bind task panicked");
+                if let Err(shutdown_error) = resources.shutdown().await {
+                    let shutdown_error = shutdown_error.context(format!(
+                        "production resource shutdown failed before rollback after client-bind failure: {bind_error:#}"
+                    ));
+                    retain_fatal_shutdown_error(&fatal_shutdown_error, &shutdown_error);
+                    return Err(shutdown_error);
+                }
+                rollback_ensured_production_session(username.clone(), reused_existing).await;
+                return Err(bind_error);
             }
         }
 
-        audio_target.set_runtime_dir(state.xdg_runtime_dir.clone());
+        audio_target.set_runtime_dir(runtime_dir);
         *active_bound_user.lock().await = Some(username.clone());
-        *active_display.lock().await = Some(display);
+        *active_connection.lock().await = Some(resources);
         info!(
             "post-auth production sesman bind for user '{}' complete (reused_existing={}, health={:?})",
-            username, ensure_result.reused_existing, ensure_result.status.health
+            username, reused_existing, ensure_result.status.health
         );
 
         Ok(bound)
     }
 }
 
-async fn resize_production_compositor(
-    wayland_socket: &std::path::Path,
-    size: DesktopSize,
-) -> Result<()> {
+#[derive(Debug, Clone)]
+struct TargetUserIdentity {
+    uid: u32,
+    gid: u32,
+    groups: String,
+}
+
+fn managed_compositor_control(
+    socket: PathBuf,
+    target_user: &TargetUserIdentity,
+) -> ManagedCompositorControl {
+    let output = std::env::var("WRDP_HEADLESS_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".to_string());
+    managed_compositor_control_with_output(socket, target_user, output)
+}
+
+fn managed_compositor_control_with_output(
+    socket: PathBuf,
+    target_user: &TargetUserIdentity,
+    output: String,
+) -> ManagedCompositorControl {
+    ManagedCompositorControl::new(
+        socket,
+        target_user.uid.to_string(),
+        target_user.gid.to_string(),
+        target_user.groups.clone(),
+        output,
+    )
+}
+
+fn resolve_target_user_identity(username: &str) -> Result<TargetUserIdentity> {
+    let user = nix::unistd::User::from_name(username)
+        .context("failed to resolve managed session account")?
+        .with_context(|| format!("unknown managed session account: {username}"))?;
+    let uid = user.uid.as_raw();
+    let gid = user.gid.as_raw();
+
+    // Keep this consistent with sesman's component launcher: setpriv receives
+    // explicit numeric supplementary groups instead of inheriting root's groups.
+    let output = std::process::Command::new("/usr/bin/id")
+        .args(["-G", username])
+        .output()
+        .with_context(|| format!("failed to resolve supplementary groups for {username}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "failed to resolve supplementary groups for {username}: id -G exited {}",
+            output.status
+        );
+    }
+    let mut groups = output
+        .stdout
+        .split(u8::is_ascii_whitespace)
+        .filter(|group| !group.is_empty())
+        .map(|group| {
+            std::str::from_utf8(group)
+                .context("id -G output was not UTF-8")?
+                .parse::<u32>()
+                .context("id -G returned a nonnumeric group")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !groups.contains(&gid) {
+        groups.push(gid);
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    if groups.is_empty() {
+        anyhow::bail!("no supplementary groups resolved for {username}");
+    }
+
+    Ok(TargetUserIdentity {
+        uid,
+        gid,
+        groups: groups
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    })
+}
+
+/// Validate the runtime directory hierarchy that contains the managed Wayland
+/// socket, before the socket file itself is validated.
+///
+/// Each directory component from the fixed base `/run/user/<uid>` down to (and
+/// including) the socket's parent directory must be a real (non-symlink)
+/// directory, owned by `expected_uid`, with mode `0700`. Rejecting a component
+/// that is a symlink, group/world-accessible, or owned by another principal
+/// narrows the TOCTOU window in which a user-writable path could be redirected
+/// to another socket between validation and use.
+///
+/// Residual risk: std cannot perform an atomic `openat(2)`-based traversal, nor
+/// bind/connect on a validated directory descriptor, so a sufficiently
+/// privileged local attacker able to swap a component between this check and the
+/// eventual `connect(2)` is not fully excluded. Component-wise validation of the
+/// fixed `/run/user/<uid>/wrdp` prefix is the strongest guarantee available
+/// without dropping to raw syscalls.
+fn validate_runtime_directory_hierarchy(wayland_socket: &Path, expected_uid: u32) -> Result<()> {
+    let base = PathBuf::from(format!("/run/user/{expected_uid}"));
+    let parent = wayland_socket
+        .parent()
+        .context("managed compositor socket has no runtime directory")?;
+    if !parent.starts_with(&base) {
+        anyhow::bail!(
+            "managed Wayland socket {} is not under the expected runtime base {}",
+            wayland_socket.display(),
+            base.display()
+        );
+    }
+
+    // Ordered directory components to validate: the runtime base and every
+    // intermediate directory down to the socket's parent (at least
+    // `/run/user/<uid>/wrdp`).
+    let mut dirs = vec![base.clone()];
+    let mut current = base.clone();
+    if let Ok(rest) = parent.strip_prefix(&base) {
+        for component in rest.components() {
+            current = current.join(component);
+            dirs.push(current.clone());
+        }
+    }
+
+    for dir in dirs {
+        let metadata = fs::symlink_metadata(&dir)
+            .with_context(|| format!("failed to inspect runtime directory {}", dir.display()))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_dir()
+            || metadata.uid() != expected_uid
+            || metadata.mode() & 0o777 != 0o700
+        {
+            anyhow::bail!(
+                "unsafe runtime directory {} (expected a non-symlink directory owned by uid {expected_uid} with mode 0700)",
+                dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_managed_wayland_socket(wayland_socket: &Path, expected_uid: u32) -> Result<()> {
+    // Validate the containing runtime directory hierarchy first, so the final
+    // socket check happens on an already-vetted path prefix.
+    validate_runtime_directory_hierarchy(wayland_socket, expected_uid)?;
+    let metadata = fs::symlink_metadata(wayland_socket).with_context(|| {
+        format!(
+            "failed to inspect managed Wayland socket {}",
+            wayland_socket.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_socket()
+        || metadata.uid() != expected_uid
+    {
+        anyhow::bail!(
+            "unsafe managed Wayland socket {} (expected a non-symlink socket owned by uid {expected_uid})",
+            wayland_socket.display()
+        );
+    }
+    Ok(())
+}
+
+async fn run_wlr_randr_as_target(
+    wayland_socket: &Path,
+    target_user: &TargetUserIdentity,
+    arguments: &[&str],
+) -> Result<std::process::Output> {
+    // Validate immediately before each client invocation.  The user-writable
+    // runtime directory must not redirect privileged daemon work to another
+    // socket between session validation and compositor control.
+    validate_managed_wayland_socket(wayland_socket, target_user.uid)?;
     let runtime_dir = wayland_socket
         .parent()
         .context("managed compositor socket has no runtime directory")?;
     let display = wayland_socket
         .file_name()
         .context("managed compositor socket has no display name")?;
-    let output = std::env::var("WRDP_HEADLESS_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".to_string());
+    let uid = target_user.uid.to_string();
+    let gid = target_user.gid.to_string();
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("/usr/bin/setpriv")
+            .args([
+                "--reuid",
+                uid.as_str(),
+                "--regid",
+                gid.as_str(),
+                "--groups",
+                target_user.groups.as_str(),
+                "--",
+                "/usr/bin/wlr-randr",
+            ])
+            .args(arguments)
+            .env("XDG_RUNTIME_DIR", runtime_dir)
+            .env("WAYLAND_DISPLAY", display)
+            // Ensure the child is reaped if this future is cancelled or the
+            // 5s bound elapses instead of leaking a wlr-randr process.
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("wlr-randr timed out after 5s")?
+    .context("failed to execute wlr-randr through setpriv")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "wlr-randr exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output)
+}
+
+fn wlr_randr_reports_current_mode(output: &[u8], size: DesktopSize) -> bool {
     let mode = format!("{}x{}", size.width, size.height);
-    let status = tokio::process::Command::new("wlr-randr")
-        .args(["--output", output.as_str(), "--custom-mode", mode.as_str()])
-        .env("XDG_RUNTIME_DIR", runtime_dir)
-        .env("WAYLAND_DISPLAY", display)
-        .status()
-        .await
-        .context("failed to execute wlr-randr")?;
-    if !status.success() {
-        anyhow::bail!("wlr-randr exited with status {status}");
+    String::from_utf8_lossy(output).lines().any(|line| {
+        let line = line.trim();
+        line.split_whitespace().next() == Some(mode.as_str())
+            && line.contains(" px")
+            && line.contains("(current)")
+    })
+}
+
+async fn resize_production_compositor(
+    wayland_socket: &Path,
+    size: DesktopSize,
+    target_user: &TargetUserIdentity,
+) -> Result<()> {
+    let output_name =
+        std::env::var("WRDP_HEADLESS_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".to_string());
+    let mode = format!("{}x{}", size.width, size.height);
+    run_wlr_randr_as_target(
+        wayland_socket,
+        target_user,
+        &[
+            "--output",
+            output_name.as_str(),
+            "--custom-mode",
+            mode.as_str(),
+        ],
+    )
+    .await?;
+
+    // wlr-randr accepting --custom-mode does not prove the compositor selected
+    // it.  Query the named output as the session user and fail closed unless
+    // that exact mode is currently active.
+    let query = run_wlr_randr_as_target(
+        wayland_socket,
+        target_user,
+        &["--output", output_name.as_str()],
+    )
+    .await?;
+    if !wlr_randr_reports_current_mode(&query.stdout, size) {
+        anyhow::bail!(
+            "managed compositor output {output_name} did not realize requested mode {mode}; query output: {}",
+            String::from_utf8_lossy(&query.stdout).trim()
+        );
     }
     info!(
         width = size.width,
         height = size.height,
-        reused_output = true,
         "managed compositor output matches negotiated desktop"
     );
     Ok(())
@@ -480,11 +1283,23 @@ async fn resize_production_compositor(
 
 fn prime_direct_frame_receiver(
     source: std::sync::mpsc::Receiver<crate::desktop::pipewire::frame::RawFrameData>,
-    timeout: std::time::Duration,
+    expected_size: DesktopSize,
+    timeout: Duration,
 ) -> Result<std::sync::mpsc::Receiver<crate::desktop::pipewire::frame::RawFrameData>> {
-    let first = source
-        .recv_timeout(timeout)
-        .context("timed out waiting for first managed-session frame")?;
+    let deadline = Instant::now() + timeout;
+    let first = loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("timed out waiting for a correctly-sized managed-session frame")?;
+        let frame = source
+            .recv_timeout(remaining)
+            .context("timed out waiting for a correctly-sized managed-session frame")?;
+        if frame.width == Some(u32::from(expected_size.width))
+            && frame.height == Some(u32::from(expected_size.height))
+        {
+            break frame;
+        }
+    };
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("primed-frame-forwarder".into())
@@ -505,42 +1320,51 @@ fn prime_direct_frame_receiver(
 async fn build_production_portal_generic_connection(
     username: &str,
     wayland_socket: PathBuf,
+    target_user: &TargetUserIdentity,
     config: Arc<Config>,
     server_event_tx: tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+    connection_invalid: Arc<Notify>,
     clipboard_manager: Option<Arc<Mutex<ClipboardOrchestrator>>>,
     gfx_server_handle: Option<Arc<RwLock<Option<ironrdp_server::GfxServerHandle>>>>,
     gfx_handler_state: Option<Arc<RwLock<Option<crate::rdp::server::HandlerState>>>>,
     desktop_size: DesktopSize,
-) -> Result<(BoundConnection, Arc<DisplayChannelHandler>)> {
+    fatal_shutdown_error: Arc<StdMutex<Option<String>>>,
+) -> Result<(BoundConnection, ProductionConnectionResources)> {
     #[cfg(not(feature = "portal-generic"))]
     {
         let _ = (
             username,
             wayland_socket,
+            target_user,
             config,
             server_event_tx,
+            connection_invalid,
             clipboard_manager,
             gfx_server_handle,
             gfx_handler_state,
             desktop_size,
+            fatal_shutdown_error,
         );
         anyhow::bail!("production wrdp requires the portal-generic feature");
     }
 
     #[cfg(feature = "portal-generic")]
     {
-        if !wayland_socket.exists() {
-            anyhow::bail!(
-                "sesman reported a healthy session for '{username}', but Wayland socket {} is missing",
-                wayland_socket.display()
-            );
-        }
-
         let portal_settings = crate::config::PortalStartupSettings::from_process(&config)?;
+        let channel_policy = production_channel_policy(&config);
+        validate_managed_wayland_socket(&wayland_socket, target_user.uid).with_context(|| {
+            format!(
+                "sesman reported an unsafe managed Wayland socket for '{username}': {}",
+                wayland_socket.display()
+            )
+        })?;
         let session_handle =
-            crate::rdp::session::backends::PortalSessionBackend::create_session_for_wayland_socket(
+            crate::rdp::session::backends::PortalSessionBackend::create_session_for_wayland_socket_with_policy_for_uid(
                 wayland_socket.clone(),
                 portal_settings,
+                channel_policy.input,
+                channel_policy.clipboard,
+                target_user.uid,
             )
             .await
             .with_context(|| {
@@ -550,103 +1374,109 @@ async fn build_production_portal_generic_connection(
                 )
             })?;
 
-        let streams = session_handle.streams();
-        if streams.is_empty() {
-            anyhow::bail!("portal-generic produced no capture streams for '{username}'");
-        }
+        let result: Result<(BoundConnection, ProductionConnectionResources)> = async {
+            let streams = session_handle.streams();
+            if streams.is_empty() {
+                anyhow::bail!("portal-generic produced no capture streams for '{username}'");
+            }
 
-        let stream_info: Vec<crate::portal::StreamInfo> = streams
-            .iter()
-            .map(|s| crate::portal::StreamInfo {
-                node_id: s.node_id,
-                position: (s.position_x, s.position_y),
-                size: (s.width, s.height),
-                source_type: crate::portal::SourceType::Monitor,
+            let stream_info: Vec<crate::portal::StreamInfo> = streams
+                .iter()
+                .map(|s| crate::portal::StreamInfo {
+                    node_id: s.node_id,
+                    position: (s.position_x, s.position_y),
+                    size: (s.width, s.height),
+                    source_type: crate::portal::SourceType::Monitor,
+                })
+                .collect();
+            let initial_size = stream_info
+                .first()
+                .map_or((1920, 1080), |s| (s.size.0 as u16, s.size.1 as u16));
+
+            let raw_rx = session_handle.direct_frame_receiver()?;
+            let raw_rx = tokio::task::spawn_blocking(move || {
+                prime_direct_frame_receiver(raw_rx, desktop_size, Duration::from_secs(2))
             })
-            .collect();
-        let initial_size = stream_info
-            .first()
-            .map_or((1920, 1080), |s| (s.size.0 as u16, s.size.1 as u16));
-
-        let raw_rx = session_handle.direct_frame_receiver()?;
-        let raw_rx = tokio::task::spawn_blocking(move || {
-            prime_direct_frame_receiver(raw_rx, std::time::Duration::from_secs(2))
-        })
-        .await
-        .context("first-frame priming task panicked")??;
-        info!("Managed-session capture primed before RDP activation");
-
-        let display_handler = Arc::new(
-            DisplayChannelHandler::new_direct(
-                desktop_size.width,
-                desktop_size.height,
-                raw_rx,
-                stream_info.clone(),
-                Some(wayland_socket.clone()),
-                None,
-                gfx_server_handle,
-                gfx_handler_state,
-                Arc::clone(&config),
-                production_service_registry(),
-            )
             .await
-            .context("failed to create production display handler")?,
-        );
-        display_handler
-            .set_server_event_sender(server_event_tx)
-            .await;
+            .context("first-frame priming task panicked")??;
+            info!("Managed-session capture primed before RDP activation");
 
-        let primary_stream_id = stream_info.first().map_or(0, |s| s.node_id);
-        let min_stream_x = stream_info.iter().map(|s| s.position.0).min().unwrap_or(0);
-        let min_stream_y = stream_info.iter().map(|s| s.position.1).min().unwrap_or(0);
-        let monitors: Vec<crate::rdp::channels::input::MonitorInfo> = stream_info
-            .iter()
-            .enumerate()
-            .map(|(idx, stream)| {
-                // Display encoding crops the capture to the negotiated desktop.
-                // Input must target that same visible crop rather than scaling
-                // coordinates into the uncropped capture dimensions.
-                let visible_width = if idx == 0 {
-                    u32::from(desktop_size.width).min(stream.size.0)
-                } else {
-                    stream.size.0
-                };
-                let visible_height = if idx == 0 {
-                    u32::from(desktop_size.height).min(stream.size.1)
-                } else {
-                    stream.size.1
-                };
-                crate::rdp::channels::input::MonitorInfo {
-                    id: idx as u32,
-                    name: format!("{} monitor {idx}", username),
-                    x: stream.position.0,
-                    y: stream.position.1,
-                    width: visible_width,
-                    height: visible_height,
-                    dpi: 96.0,
-                    scale_factor: 1.0,
-                    stream_x: (i64::from(stream.position.0) - i64::from(min_stream_x)) as u32,
-                    stream_y: (i64::from(stream.position.1) - i64::from(min_stream_y)) as u32,
-                    stream_width: visible_width,
-                    stream_height: visible_height,
-                    is_primary: idx == 0,
-                }
-            })
-            .collect();
+            let display_handler = Arc::new(
+                DisplayChannelHandler::new_direct(
+                    desktop_size.width,
+                    desktop_size.height,
+                    raw_rx,
+                    stream_info.clone(),
+                    Some(managed_compositor_control(
+                        wayland_socket.clone(),
+                        target_user,
+                    )),
+                    None,
+                    gfx_server_handle,
+                    gfx_handler_state,
+                    Arc::clone(&config),
+                    production_service_registry(),
+                )
+                .await
+                .context("failed to create production display handler")?,
+            );
+            display_handler
+                .set_server_event_sender(server_event_tx.clone())
+                .await;
 
-        let clipboard_provider: Option<
-            Arc<dyn crate::rdp::channels::clipboard::ClipboardProvider>,
-        > = match clipboard_manager.as_ref() {
-            Some(manager) => {
-                #[cfg(feature = "portal-generic")]
-                {
-                    match session_handle.clipboard_source() {
+            let channel_policy = production_channel_policy(&config);
+            let (bound_input, input_handler): (
+                Box<dyn RdpServerInputHandler>,
+                Option<InputChannelHandler>,
+            ) = if channel_policy.input {
+                let primary_stream_id = stream_info.first().map_or(0, |s| s.node_id);
+                let min_stream_x = stream_info.iter().map(|s| s.position.0).min().unwrap_or(0);
+                let min_stream_y = stream_info.iter().map(|s| s.position.1).min().unwrap_or(0);
+                let monitors: Vec<crate::rdp::channels::input::MonitorInfo> = stream_info
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, stream)| {
+                        // Display encoding crops the capture to the negotiated desktop.
+                        // Input must target that same visible crop rather than scaling
+                        // coordinates into the uncropped capture dimensions.
+                        let visible_width = if idx == 0 {
+                            u32::from(desktop_size.width).min(stream.size.0)
+                        } else {
+                            stream.size.0
+                        };
+                        let visible_height = if idx == 0 {
+                            u32::from(desktop_size.height).min(stream.size.1)
+                        } else {
+                            stream.size.1
+                        };
+                        crate::rdp::channels::input::MonitorInfo {
+                            id: idx as u32,
+                            name: format!("{} monitor {idx}", username),
+                            x: stream.position.0,
+                            y: stream.position.1,
+                            width: visible_width,
+                            height: visible_height,
+                            dpi: 96.0,
+                            scale_factor: 1.0,
+                            stream_x: (i64::from(stream.position.0) - i64::from(min_stream_x)) as u32,
+                            stream_y: (i64::from(stream.position.1) - i64::from(min_stream_y)) as u32,
+                            stream_width: visible_width,
+                            stream_height: visible_height,
+                            is_primary: idx == 0,
+                        }
+                    })
+                    .collect();
+
+                let clipboard_provider: Option<
+                    Arc<dyn crate::rdp::channels::clipboard::ClipboardProvider>,
+                > = match clipboard_manager.as_ref() {
+                    Some(manager) => match session_handle.clipboard_source() {
                         crate::rdp::session::backend::ClipboardSource::DataControl(ref backend) => {
                             let provider = Arc::new(
-                                    crate::rdp::channels::clipboard::providers::DataControlClipboardProvider::new(
-                                        Arc::clone(backend),
-                                    ),
-                                );
+                                crate::rdp::channels::clipboard::providers::DataControlClipboardProvider::new(
+                                    Arc::clone(backend),
+                                ),
+                            );
                             manager
                                 .lock()
                                 .await
@@ -666,57 +1496,121 @@ async fn build_production_portal_generic_connection(
                             );
                             None
                         }
-                    }
-                }
-                #[cfg(not(feature = "portal-generic"))]
-                {
-                    let _ = manager;
-                    None
-                }
+                    },
+                    None => None,
+                };
+
+                let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+                let input_handler = InputChannelHandler::new(
+                    session_handle.clone(),
+                    monitors,
+                    primary_stream_id,
+                    input_tx,
+                    Some(display_handler.get_update_sender()),
+                    Some(display_handler.get_gfx_handler_state()),
+                    input_rx,
+                    shutdown_rx,
+                    &config.input.keyboard_layout,
+                    config.input.cjk_paste_fallback,
+                    clipboard_provider,
+                )
+                .context("failed to create production input handler")?;
+                display_handler
+                    .set_input_handler(Arc::new(input_handler.clone()))
+                    .await;
+                let health_input_handler = input_handler.clone();
+                (
+                    Box::new(ProductionBoundInput {
+                        inner: input_handler,
+                        _shutdown_tx: shutdown_tx,
+                    }),
+                    Some(health_input_handler),
+                )
+            } else {
+                debug_assert!(!channel_policy.clipboard);
+                debug_assert!(clipboard_manager.is_none());
+                info!(
+                    "production view-only policy active for '{username}'; input and clipboard are detached"
+                );
+                (Box::new(ProductionViewOnlyInput), None)
+            };
+
+            let (supervision_shutdown, _) = broadcast::channel(1);
+            let (monitor, reporter, subscriber) =
+                SessionSupervisor::new(supervision_shutdown.subscribe());
+            session_handle.set_health_reporter(reporter.clone());
+            display_handler.set_health_reporter(reporter.clone()).await;
+            if let Some(input_handler) = input_handler.as_ref() {
+                input_handler.set_health_reporter(reporter.clone());
             }
-            None => None,
-        };
+            if let Some(manager) = clipboard_manager.as_ref() {
+                manager
+                    .lock()
+                    .await
+                    .set_health_reporter(reporter.clone());
+            }
+            if !channel_policy.input {
+                reporter.report(SessionStatusEvent::SubsystemNotAvailable {
+                    subsystem: "input".to_string(),
+                });
+            }
+            if !channel_policy.clipboard {
+                reporter.report(SessionStatusEvent::SubsystemNotAvailable {
+                    subsystem: "clipboard".to_string(),
+                });
+            }
 
-        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let input_handler = InputChannelHandler::new(
-            session_handle.clone(),
-            monitors,
-            primary_stream_id,
-            input_tx,
-            Some(display_handler.get_update_sender()),
-            Some(display_handler.get_gfx_handler_state()),
-            input_rx,
-            shutdown_rx,
-            &config.input.keyboard_layout,
-            config.input.cjk_paste_fallback,
-            clipboard_provider,
-        )
-        .context("failed to create production input handler")?;
-        display_handler
-            .set_input_handler(Arc::new(input_handler.clone()))
-            .await;
-        Arc::clone(&display_handler).start_pipeline();
+            let monitor_handle = tokio::spawn(monitor.run());
+            let watcher_handle = tokio::spawn(watch_production_session_health(
+                subscriber,
+                Arc::clone(&connection_invalid),
+            ));
 
-        info!(
-            "production wrdp attached user '{}' to {} with {} stream(s), capture={}x{}, negotiated={}x{}",
-            username,
-            wayland_socket.display(),
-            stream_info.len(),
-            initial_size.0,
-            initial_size.1,
-            desktop_size.width,
-            desktop_size.height,
-        );
+            Arc::clone(&display_handler).start_pipeline();
 
-        let bound = BoundConnection {
-            display: Box::new((*display_handler).clone()),
-            input: Box::new(ProductionBoundInput {
-                inner: input_handler,
-                _shutdown_tx: shutdown_tx,
-            }),
-        };
-        Ok((bound, display_handler))
+            info!(
+                "production wrdp attached user '{}' to {} with {} stream(s), capture={}x{}, negotiated={}x{}",
+                username,
+                wayland_socket.display(),
+                stream_info.len(),
+                initial_size.0,
+                initial_size.1,
+                desktop_size.width,
+                desktop_size.height,
+            );
+
+            let bound = BoundConnection {
+                display: Box::new((*display_handler).clone()),
+                input: bound_input,
+            };
+            Ok((
+                bound,
+                ProductionConnectionResources {
+                    display: display_handler,
+                    session_handle: Arc::clone(&session_handle),
+                    connection_invalid,
+                    supervision_shutdown,
+                    monitor_handle,
+                    watcher_handle,
+                },
+            ))
+        }
+        .await;
+
+        match result {
+            Ok(connection) => Ok(connection),
+            Err(error) => match session_handle.shutdown().await {
+                Ok(()) => Err(error),
+                Err(shutdown_error) => {
+                    let shutdown_error = shutdown_error.context(format!(
+                        "portal-generic shutdown failed after production connection builder error: {error:#}"
+                    ));
+                    retain_fatal_shutdown_error(&fatal_shutdown_error, &shutdown_error);
+                    Err(shutdown_error)
+                }
+            },
+        }
     }
 }
 
@@ -731,6 +1625,14 @@ fn production_service_registry() -> Arc<crate::services::RuntimeCapabilities> {
     Arc::new(crate::services::RuntimeCapabilities::from_compositor(
         &capabilities,
     ))
+}
+
+struct ProductionViewOnlyInput;
+
+impl RdpServerInputHandler for ProductionViewOnlyInput {
+    fn keyboard(&mut self, _event: KeyboardEvent) {}
+
+    fn mouse(&mut self, _event: MouseEvent) {}
 }
 
 struct ProductionBoundInput {
@@ -790,28 +1692,198 @@ mod tests {
     use super::*;
     use crate::rdp::server::EgfxCodecPolicy;
 
+    fn raw_frame(
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    ) -> crate::desktop::pipewire::frame::RawFrameData {
+        crate::desktop::pipewire::frame::RawFrameData {
+            data,
+            width: Some(width),
+            height: Some(height),
+            stride: Some(width * 4),
+            format: None,
+        }
+    }
+
     #[test]
-    fn first_frame_is_preserved_when_capture_is_primed() {
+    fn invalid_health_watcher_only_builds_reason_for_invalid_status() {
+        let healthy = SessionStatus::default();
+        assert!(invalid_session_reason(&healthy).is_none());
+
+        let invalid = SessionStatus {
+            overall: OverallStatus::Invalid,
+            ..SessionStatus::default()
+        };
+        assert!(
+            invalid_session_reason(&invalid)
+                .unwrap()
+                .starts_with("production session invalid:")
+        );
+    }
+
+    #[test]
+    fn cancellation_is_deferred_only_while_admission_is_running() {
+        assert_eq!(
+            cancellation_decision(false, false),
+            CancellationDecision::Cancel
+        );
+        assert_eq!(
+            cancellation_decision(true, false),
+            CancellationDecision::DeferUntilAdmissionFinishes
+        );
+        assert_eq!(
+            cancellation_decision(true, true),
+            CancellationDecision::Cancel
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_finished_guard_sets_flag_and_notifies() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Notify::new());
+        let notified = notify.notified();
+
+        {
+            let _guard = AdmissionFinishedGuard::new(Arc::clone(&finished), Arc::clone(&notify));
+            assert!(!finished.load(Ordering::Acquire));
+        }
+
+        assert!(finished.load(Ordering::Acquire));
+        tokio::time::timeout(Duration::from_millis(10), notified)
+            .await
+            .expect("guard did not notify admission completion");
+    }
+
+    #[test]
+    fn first_matching_frame_is_preserved_when_capture_is_primed() {
         let (sender, source) = std::sync::mpsc::channel();
-        sender
-            .send(crate::desktop::pipewire::frame::RawFrameData {
-                data: vec![1, 2, 3, 4],
-                width: Some(1),
-                height: Some(1),
-                stride: Some(4),
-                format: None,
-            })
-            .unwrap();
+        sender.send(raw_frame(2, 1, vec![9, 9, 9, 9])).unwrap();
+        sender.send(raw_frame(1, 1, vec![1, 2, 3, 4])).unwrap();
         drop(sender);
-        let receiver =
-            prime_direct_frame_receiver(source, std::time::Duration::from_millis(10)).unwrap();
+
+        let receiver = prime_direct_frame_receiver(
+            source,
+            DesktopSize {
+                width: 1,
+                height: 1,
+            },
+            Duration::from_millis(10),
+        )
+        .unwrap();
         assert_eq!(receiver.recv().unwrap().data, vec![1, 2, 3, 4]);
     }
 
     #[test]
     fn first_frame_priming_times_out_cleanly() {
         let (_sender, source) = std::sync::mpsc::channel();
-        assert!(prime_direct_frame_receiver(source, std::time::Duration::from_millis(1)).is_err());
+        assert!(
+            prime_direct_frame_receiver(
+                source,
+                DesktopSize {
+                    width: 1,
+                    height: 1,
+                },
+                Duration::from_millis(1),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn managed_compositor_control_propagates_target_identity_and_output() {
+        let identity = TargetUserIdentity {
+            uid: 1001,
+            gid: 1002,
+            groups: "1002,1003".to_string(),
+        };
+        let socket = PathBuf::from("/run/user/1001/wrdp/wayland-0");
+
+        assert_eq!(
+            managed_compositor_control_with_output(
+                socket.clone(),
+                &identity,
+                "HEADLESS-2".to_string(),
+            ),
+            ManagedCompositorControl::new(
+                socket,
+                "1001".to_string(),
+                "1002".to_string(),
+                "1002,1003".to_string(),
+                "HEADLESS-2".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn initial_geometry_policy_is_fail_closed() {
+        let mut config = Config::default();
+        let default = PRODUCTION_DEFAULT_DESKTOP_SIZE;
+        assert_eq!(
+            DisplayChannelHandler::validate_geometry_policy(&config, default, Some(default))
+                .unwrap(),
+            default
+        );
+
+        config.display.allow_resize = false;
+        assert!(
+            DisplayChannelHandler::validate_geometry_policy(
+                &config,
+                DesktopSize {
+                    width: 1280,
+                    height: 720,
+                },
+                Some(default),
+            )
+            .is_err()
+        );
+
+        config.display.allow_resize = true;
+        config.display.allowed_resolutions = vec!["1280x720".to_string()];
+        assert!(
+            DisplayChannelHandler::validate_geometry_policy(
+                &config,
+                DesktopSize {
+                    width: 0,
+                    height: 720,
+                },
+                Some(default),
+            )
+            .is_err()
+        );
+        assert!(
+            DisplayChannelHandler::validate_geometry_policy(
+                &config,
+                DesktopSize {
+                    width: 3840,
+                    height: 2401,
+                },
+                Some(default),
+            )
+            .is_err()
+        );
+        assert!(
+            DisplayChannelHandler::validate_geometry_policy(
+                &config,
+                DesktopSize {
+                    width: 1920,
+                    height: 1080,
+                },
+                Some(default),
+            )
+            .is_err()
+        );
+        assert!(
+            DisplayChannelHandler::validate_geometry_policy(
+                &config,
+                DesktopSize {
+                    width: 1280,
+                    height: 720,
+                },
+                Some(default),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -828,5 +1900,127 @@ mod tests {
             effective_codec_policy(EgfxCodecPolicy::Avc444, true),
             EgfxCodecPolicy::Avc444
         );
+    }
+
+    #[test]
+    fn view_only_policy_detaches_input_and_clipboard() {
+        let mut config = Config::default();
+        config.clipboard.enabled = true;
+        config.server.view_only = true;
+
+        assert_eq!(
+            production_channel_policy(&config),
+            ProductionChannelPolicy {
+                clipboard: false,
+                input: false,
+            }
+        );
+
+        config.server.view_only = false;
+        assert_eq!(
+            production_channel_policy(&config),
+            ProductionChannelPolicy {
+                clipboard: true,
+                input: true,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_hierarchy_rejects_path_outside_runtime_base() {
+        // A socket outside /run/user/<uid> must be rejected before any
+        // filesystem inspection of the (attacker-chosen) prefix.
+        let socket = Path::new("/tmp/evil/wayland-0");
+        assert!(validate_runtime_directory_hierarchy(socket, 1000).is_err());
+    }
+
+    #[test]
+    fn runtime_hierarchy_rejects_nonexistent_runtime_base() {
+        // A path under the expected base but whose components do not exist must
+        // fail closed rather than silently pass validation.
+        let socket = PathBuf::from("/run/user/424242/wrdp/wayland-0");
+        assert!(validate_runtime_directory_hierarchy(&socket, 424242).is_err());
+    }
+
+    #[test]
+    fn view_only_input_implements_pinned_ironrdp_noop_trait() {
+        fn assert_input_handler<T: RdpServerInputHandler>() {}
+        assert_input_handler::<ProductionViewOnlyInput>();
+
+        let mut input = ProductionViewOnlyInput;
+        input.keyboard(KeyboardEvent::Pressed {
+            code: 30,
+            extended: false,
+        });
+        input.mouse(MouseEvent::Move { x: 10, y: 20 });
+    }
+
+    #[test]
+    fn systemd_listener_address_must_match_exactly() {
+        let expected: SocketAddr = "127.0.0.1:3389".parse().unwrap();
+        assert!(validate_systemd_listener_addr(expected, expected).is_ok());
+
+        let wildcard: SocketAddr = "0.0.0.0:3389".parse().unwrap();
+        let wrong_family: SocketAddr = "[::1]:3389".parse().unwrap();
+        assert!(validate_systemd_listener_addr(expected, wildcard).is_err());
+        assert!(validate_systemd_listener_addr(expected, wrong_family).is_err());
+    }
+
+    #[test]
+    fn systemd_listener_must_accept_connections() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(validate_systemd_listener_accepts_connections(&listener).is_ok());
+
+        let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        assert!(validate_systemd_listener_accepts_connections(&stream).is_err());
+    }
+
+    #[test]
+    fn timeout_selection_stops_pre_auth_only_until_binding_begins() {
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            selected_connection_timeout(started, false, None),
+            Some(SelectedConnectionTimeout {
+                deadline: started + PRE_AUTH_TIMEOUT,
+                phase: ConnectionTimeoutPhase::PreAuth,
+            })
+        );
+        assert_eq!(selected_connection_timeout(started, true, None), None);
+
+        let short_session = Duration::from_secs(10);
+        assert_eq!(
+            selected_connection_timeout(started, false, Some(short_session)),
+            Some(SelectedConnectionTimeout {
+                deadline: started + short_session,
+                phase: ConnectionTimeoutPhase::Session,
+            })
+        );
+
+        let long_session = Duration::from_secs(90);
+        assert_eq!(
+            selected_connection_timeout(started, true, Some(long_session)),
+            Some(SelectedConnectionTimeout {
+                deadline: started + long_session,
+                phase: ConnectionTimeoutPhase::Session,
+            })
+        );
+    }
+
+    #[test]
+    fn accept_retry_policy_classifies_and_caps_recoverable_errors() {
+        assert!(is_recoverable_accept_error(&io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "aborted",
+        )));
+        assert!(is_recoverable_accept_error(&io::Error::from_raw_os_error(
+            libc::EMFILE
+        )));
+        assert!(!is_recoverable_accept_error(&io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid listener",
+        )));
+
+        assert_eq!(accept_retry_delay(1), Duration::from_millis(10));
+        assert_eq!(accept_retry_delay(u32::MAX), MAX_ACCEPT_RETRY_DELAY);
     }
 }

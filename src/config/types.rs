@@ -36,7 +36,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:3389".to_string(),
-            max_connections: 10,
+            max_connections: 1,
             session_timeout: 0,
             use_portals: true,
             view_only: false,

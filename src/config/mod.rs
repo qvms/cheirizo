@@ -176,6 +176,12 @@ impl Config {
             .listen_addr
             .parse::<SocketAddr>()
             .context("Invalid listen address")?;
+        if self.server.max_connections != 1 {
+            anyhow::bail!(
+                "server.max_connections must be 1 because production wrdp uses a serial single-client model (got {})",
+                self.server.max_connections
+            );
+        }
         require_file(&self.security.cert_path, "Certificate")?;
         require_file(&self.security.key_path, "Private key")?;
         require_choice(
@@ -489,6 +495,7 @@ mod tests {
     fn test_default_config() {
         let config = Config::default_config().unwrap();
         assert_eq!(config.server.listen_addr, "0.0.0.0:3389");
+        assert_eq!(config.server.max_connections, 1);
         assert!(config.server.use_portals);
         assert_eq!(config.video.target_fps, 30);
     }
@@ -498,6 +505,19 @@ mod tests {
         let mut config = Config::default_config().unwrap();
         config.server.listen_addr = "invalid".to_string();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_validation_rejects_non_serial_connection_limit() {
+        let mut config = Config::default_config().unwrap();
+        config.server.max_connections = 2;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(
+            error.contains("server.max_connections must be 1"),
+            "{error}"
+        );
+        assert!(error.contains("serial single-client"), "{error}");
     }
 
     #[test]

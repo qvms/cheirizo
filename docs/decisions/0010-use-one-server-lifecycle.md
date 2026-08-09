@@ -7,7 +7,7 @@
 
 WRDP has one listener and connection lifecycle, owned by `src/rdp/server/`. The `wrdp` binary parses configuration and diagnostic commands, then calls that server entrypoint.
 
-Authentication, post-auth session binding, display/input handlers, clipboard, EGFX, socket activation and disconnect cleanup are wired once. Alternative desktop backends remain behind the session backend interface; they do not create a second listener implementation.
+Authentication, post-auth session binding, admission deadlines, display/input handlers, clipboard, EGFX, supervision, socket activation and disconnect cleanup are wired once. Alternative desktop backends remain behind the session backend interface; they do not create a second listener implementation.
 
 ## Why
 
@@ -20,8 +20,11 @@ One lifecycle makes supported behavior visible and keeps channel policy out of t
 - `src/bin/wrdp.rs` owns CLI and diagnostics only.
 - `src/rdp/server/` owns listener startup through disconnect cleanup.
 - CLI listener overrides are applied before server startup.
+- Production enforces one admitted connection; `server.max_connections` must be `1`.
 - New channel or authentication features are wired in one place.
 - When Advanced Input is active, it owns mouse delivery and the overlapping core mouse path is suppressed for that connection.
+- View-only policy removes both RDP channel exposure and backend input/clipboard objects.
+- Permanent session, capture or input failure cancels only the current connection generation; stale health events cannot terminate the next client.
 - Removed server paths do not receive compatibility shims in the new public history.
 
 ## Alternatives considered

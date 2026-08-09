@@ -237,6 +237,12 @@ pub struct WlrConfig {
     /// Takes precedence over `wayland_display` and the process environment.
     pub wayland_socket_path: Option<PathBuf>,
 
+    /// Required UID of the peer behind `wayland_socket_path`.
+    ///
+    /// `None` preserves compatibility for unmanaged displays. Managed sessions
+    /// set this to prevent a replaced socket from impersonating the compositor.
+    pub expected_wayland_peer_uid: Option<u32>,
+
     /// XKB layout used by the virtual keyboard (for example `us` or `pt`).
     pub keyboard_layout: String,
 }
@@ -246,6 +252,7 @@ impl Default for WlrConfig {
         Self {
             wayland_display: None,
             wayland_socket_path: None,
+            expected_wayland_peer_uid: None,
             keyboard_layout: "us".into(),
         }
     }

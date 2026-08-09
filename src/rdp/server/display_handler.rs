@@ -66,12 +66,15 @@
 
 use std::{
     borrow::Cow,
+    fs,
     num::{NonZeroU16, NonZeroUsize},
+    os::unix::fs::{FileTypeExt, MetadataExt},
+    path::{Component, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -106,9 +109,8 @@ use crate::rdp::channels::graphics::egfx::{HardwareEncoder, create_hardware_enco
 
 /// Client-initiated resize request
 ///
-/// Sent from `request_layout()` (sync context) to the pipeline loop (async)
-/// via a bounded sync channel. The pipeline coalesces multiple requests
-/// and executes the resize sequence.
+/// Recorded by `request_layout()` (sync context) and consumed by the pipeline
+/// loop (async). The coordinator coalesces requests into one transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ResizeRequest {
     width: u16,
@@ -117,49 +119,360 @@ struct ResizeRequest {
 
 #[derive(Debug)]
 struct ResizeCoordinator {
+    /// The most recent requested geometry. Drag-resize intermediate values have
+    /// no value once a newer value exists.
+    pending: Option<ResizeRequest>,
+    /// Geometry for which the compositor command has been issued.
+    in_flight: Option<ResizeRequest>,
+    /// A realized transaction whose display state is being committed.
+    committing: Option<ResizeRequest>,
+    /// The geometry actually advertised to the RDP client.
     applied: ResizeRequest,
-    queued: std::collections::VecDeque<ResizeRequest>,
-    next_allowed: Option<std::time::Instant>,
+    /// Both retries and post-reactivation requests are held behind this guard.
+    retry_not_before: Option<std::time::Instant>,
+    /// A successful mode command must be confirmed by a matching capture frame.
+    realization_deadline: Option<std::time::Instant>,
 }
 
 impl ResizeCoordinator {
-    const CAPACITY: usize = 8;
     // IronRDP exposes no completion callback for Deactivate-Reactivate.
-    // Serialize updates conservatively so a second resize is not injected into
-    // capability exchange. This favors correctness over smooth drag-resizing.
     const REACTIVATION_GUARD: std::time::Duration = std::time::Duration::from_secs(2);
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+    const REALIZATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
     fn new(width: u16, height: u16) -> Self {
         Self {
+            pending: None,
+            in_flight: None,
+            committing: None,
             applied: ResizeRequest { width, height },
-            queued: std::collections::VecDeque::new(),
-            next_allowed: None,
+            retry_not_before: None,
+            realization_deadline: None,
         }
     }
 
     fn request(&mut self, request: ResizeRequest) {
-        if self.queued.back().copied() == Some(request)
-            || (self.queued.is_empty() && self.applied == request)
-        {
+        if self.in_flight == Some(request) || self.committing == Some(request) {
+            // This newest request restores the active geometry, so it also
+            // replaces any different pending request that had superseded it.
+            self.pending = None;
             return;
         }
-        if self.queued.len() == Self::CAPACITY {
-            self.queued.pop_front();
+        if self.in_flight.is_none() && self.applied == request {
+            self.pending = None;
+            return;
         }
-        self.queued.push_back(request);
+
+        // A newer request intentionally replaces rather than queues the older
+        // one. A differing in-flight request is thereby made stale and can no
+        // longer be committed when its frame arrives.
+        self.pending = Some(request);
     }
 
     fn take_ready(&mut self, now: std::time::Instant) -> Option<ResizeRequest> {
-        self.next_allowed
-            .is_none_or(|deadline| now >= deadline)
-            .then(|| self.queued.pop_front())
-            .flatten()
+        if self.committing.is_some() {
+            return None;
+        }
+        if self.in_flight.is_some() {
+            if self.pending.is_some() {
+                self.in_flight = None;
+                self.realization_deadline = None;
+            } else {
+                return None;
+            }
+        }
+
+        if self.retry_not_before.is_some_and(|deadline| now < deadline) {
+            return None;
+        }
+
+        let request = self.pending.take()?;
+        if request == self.applied {
+            return None;
+        }
+        self.in_flight = Some(request);
+        self.realization_deadline = None;
+        Some(request)
     }
 
-    fn mark_applied(&mut self, request: ResizeRequest, now: std::time::Instant) {
-        self.applied = request;
-        self.next_allowed = Some(now + Self::REACTIVATION_GUARD);
+    /// Record that the compositor accepted the mode command and start waiting
+    /// for capture to prove that the new mode is real.
+    fn mark_command_succeeded(&mut self, request: ResizeRequest, now: std::time::Instant) -> bool {
+        if self.in_flight != Some(request) || self.pending.is_some() {
+            return false;
+        }
+        self.realization_deadline = Some(now + Self::REALIZATION_TIMEOUT);
+        true
     }
+
+    /// Return a failed transaction to the latest-wins pending slot, unless a
+    /// newer request has already superseded it.
+    fn mark_failed(&mut self, request: ResizeRequest, now: std::time::Instant) -> bool {
+        if self.in_flight != Some(request) {
+            return false;
+        }
+
+        self.in_flight = None;
+        self.realization_deadline = None;
+        if self.pending.is_some() {
+            return false;
+        }
+
+        self.pending = Some(request);
+        self.retry_not_before = Some(now + Self::RETRY_DELAY);
+        true
+    }
+
+    fn expire_realization(&mut self, now: std::time::Instant) -> Option<ResizeRequest> {
+        let request = self.in_flight?;
+        if self
+            .realization_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.mark_failed(request, now);
+            Some(request)
+        } else {
+            None
+        }
+    }
+
+    fn matches_realized_frame(
+        &self,
+        width: u32,
+        height: u32,
+        now: std::time::Instant,
+    ) -> Option<ResizeRequest> {
+        let request = self.in_flight?;
+        if self.pending.is_none()
+            && self
+                .realization_deadline
+                .is_some_and(|deadline| now <= deadline)
+            && (width, height) == (u32::from(request.width), u32::from(request.height))
+        {
+            Some(request)
+        } else {
+            None
+        }
+    }
+
+    /// Freeze a realized in-flight transaction before awaiting display-state
+    /// locks. Requests received after this point are the next transaction,
+    /// rather than making an already-realized frame obsolete.
+    fn begin_commit(&mut self, request: ResizeRequest, now: std::time::Instant) -> bool {
+        if self.matches_realized_frame(u32::from(request.width), u32::from(request.height), now)
+            != Some(request)
+        {
+            return false;
+        }
+        self.in_flight = None;
+        self.realization_deadline = None;
+        self.committing = Some(request);
+        true
+    }
+
+    fn mark_commit_failed(&mut self, request: ResizeRequest, now: std::time::Instant) -> bool {
+        if self.committing != Some(request) {
+            return false;
+        }
+        self.committing = None;
+        if self.pending.is_some() {
+            return false;
+        }
+        self.pending = Some(request);
+        self.retry_not_before = Some(now + Self::RETRY_DELAY);
+        true
+    }
+
+    fn mark_applied(&mut self, request: ResizeRequest, now: std::time::Instant) -> bool {
+        if self.committing != Some(request) {
+            return false;
+        }
+        self.applied = request;
+        self.committing = None;
+        self.retry_not_before = Some(now + Self::REACTIVATION_GUARD);
+        true
+    }
+}
+
+/// Privileged daemon configuration for controlling a compositor owned by a
+/// managed session user.
+///
+/// Dynamic resize is only available when the production binder supplies this
+/// control. Its fixed executable paths and credentials prevent a process-wide
+/// root environment from selecting the compositor client or target socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedCompositorControl {
+    socket: PathBuf,
+    expected_uid: String,
+    expected_gid: String,
+    expected_groups: String,
+    output: String,
+}
+
+impl ManagedCompositorControl {
+    pub(crate) fn new(
+        socket: PathBuf,
+        expected_uid: String,
+        expected_gid: String,
+        expected_groups: String,
+        output: String,
+    ) -> Self {
+        Self {
+            socket,
+            expected_uid,
+            expected_gid,
+            expected_groups,
+            output,
+        }
+    }
+
+    fn validate_socket(&self) -> Result<()> {
+        let expected_uid = self
+            .expected_uid
+            .parse::<u32>()
+            .context("managed compositor control has an invalid expected uid")?;
+        let base = PathBuf::from(format!("/run/user/{expected_uid}"));
+        let parent = self
+            .socket
+            .parent()
+            .context("managed compositor socket has no runtime directory")?;
+        if !parent.starts_with(&base) {
+            anyhow::bail!(
+                "managed Wayland socket {} is not under expected runtime base {}",
+                self.socket.display(),
+                base.display()
+            );
+        }
+
+        let mut directories = vec![base.clone()];
+        let mut directory = base.clone();
+        let relative_parent = parent
+            .strip_prefix(&base)
+            .context("managed compositor socket has an invalid runtime directory")?;
+        for component in relative_parent.components() {
+            let Component::Normal(component) = component else {
+                anyhow::bail!("managed compositor socket has an unsafe runtime path");
+            };
+            directory.push(component);
+            directories.push(directory.clone());
+        }
+
+        for directory in directories {
+            let metadata = fs::symlink_metadata(&directory).with_context(|| {
+                format!(
+                    "failed to inspect runtime directory {}",
+                    directory.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink()
+                || !metadata.file_type().is_dir()
+                || metadata.uid() != expected_uid
+                || metadata.mode() & 0o777 != 0o700
+            {
+                anyhow::bail!(
+                    "unsafe runtime directory {} (expected a non-symlink directory owned by uid {} with mode 0700)",
+                    directory.display(),
+                    expected_uid
+                );
+            }
+        }
+
+        let metadata = fs::symlink_metadata(&self.socket).with_context(|| {
+            format!(
+                "failed to inspect managed Wayland socket {}",
+                self.socket.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.file_type().is_socket()
+            || metadata.uid() != expected_uid
+        {
+            anyhow::bail!(
+                "unsafe managed Wayland socket {} (expected a non-symlink socket owned by uid {})",
+                self.socket.display(),
+                expected_uid
+            );
+        }
+        Ok(())
+    }
+
+    async fn run_wlr_randr(&self, arguments: &[&str]) -> Result<std::process::Output> {
+        // Check on every use because the runtime directory is controlled by the
+        // target user and can change after session setup.
+        self.validate_socket()?;
+        let runtime_dir = self
+            .socket
+            .parent()
+            .context("managed compositor socket has no runtime directory")?;
+        let display = self
+            .socket
+            .file_name()
+            .context("managed compositor socket has no display name")?;
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new("/usr/bin/setpriv")
+                .env_clear()
+                .args([
+                    "--reuid",
+                    self.expected_uid.as_str(),
+                    "--regid",
+                    self.expected_gid.as_str(),
+                    "--groups",
+                    self.expected_groups.as_str(),
+                    "--",
+                    "/usr/bin/wlr-randr",
+                ])
+                .args(arguments)
+                .env("XDG_RUNTIME_DIR", runtime_dir)
+                .env("WAYLAND_DISPLAY", display)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .context("wlr-randr timed out after 5s")?
+        .context("failed to execute wlr-randr through setpriv")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "wlr-randr exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(output)
+    }
+
+    async fn resize(&self, width: u16, height: u16) -> Result<()> {
+        let mode = format!("{width}x{height}");
+        self.run_wlr_randr(&[
+            "--output",
+            self.output.as_str(),
+            "--custom-mode",
+            mode.as_str(),
+        ])
+        .await?;
+
+        let query = self
+            .run_wlr_randr(&["--output", self.output.as_str()])
+            .await?;
+        if !wlr_randr_reports_current_mode(&query.stdout, width, height) {
+            anyhow::bail!(
+                "managed compositor output {} did not realize requested mode {mode}; query output: {}",
+                self.output,
+                String::from_utf8_lossy(&query.stdout).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn wlr_randr_reports_current_mode(output: &[u8], width: u16, height: u16) -> bool {
+    let mode = format!("{width}x{height}");
+    String::from_utf8_lossy(output).lines().any(|line| {
+        let line = line.trim();
+        line.split_whitespace().next() == Some(mode.as_str())
+            && line.contains(" px")
+            && line.contains("(current)")
+    })
 }
 
 /// Video encoder abstraction for codec-agnostic frame encoding
@@ -385,8 +698,10 @@ pub struct DisplayChannelHandler {
     /// Monitor configuration from streams
     stream_info: Vec<StreamInfo>,
 
-    /// Explicit managed compositor socket used for output resizing.
-    compositor_socket: Option<std::path::PathBuf>,
+    /// Credential-bound control for a managed compositor. Absence disables
+    /// dynamic output changes rather than running a client in the daemon's
+    /// environment.
+    managed_compositor: Option<ManagedCompositorControl>,
 
     // === EGFX/H.264 Support ===
     /// Shared GFX server handle for EGFX frame sending
@@ -414,8 +729,7 @@ pub struct DisplayChannelHandler {
     /// proper EGFX initialization.
     egfx_needs_init: Arc<std::sync::atomic::AtomicBool>,
 
-    /// Input handler reference for reconnection notification
-    /// When client reconnects, we notify input handler to reset internal state
+    /// Input handler reference for geometry and health coordination.
     input_handler: Arc<RwLock<Option<InputChannelHandler>>>,
 
     /// Clipboard manager reference for disconnect cleanup
@@ -426,7 +740,7 @@ pub struct DisplayChannelHandler {
         >,
     >,
 
-    /// Ordered, bounded resize requests serialized across core reactivation.
+    /// Latest-wins compositor resize transaction coordinated with capture realization.
     resize: Arc<std::sync::Mutex<ResizeCoordinator>>,
 
     /// Stops this connection-owned pipeline permanently during cleanup.
@@ -457,15 +771,58 @@ fn starts_in_bitmap_mode(config: &crate::config::Config) -> bool {
     !config.egfx.enabled || config.egfx.codec == "bitmap"
 }
 
-fn replace_desktop_size(size: &mut DesktopSize, width: u16, height: u16) -> bool {
-    if (size.width, size.height) == (width, height) {
-        return false;
-    }
-    *size = DesktopSize { width, height };
-    true
-}
-
 impl DisplayChannelHandler {
+    /// Validate a desktop geometry before it can affect compositor or RDP state.
+    ///
+    /// `fixed_size` is supplied for initial negotiation.  With resize disabled,
+    /// only that already-configured size is acceptable: the binder cannot ask an
+    /// RDP client to renegotiate after it has created the managed session.
+    pub(crate) fn validate_geometry_policy(
+        config: &crate::config::Config,
+        requested: DesktopSize,
+        fixed_size: Option<DesktopSize>,
+    ) -> Result<DesktopSize> {
+        const MAX_DESKTOP_AREA: u64 = 3840 * 2400;
+
+        if requested.width == 0 || requested.height == 0 {
+            anyhow::bail!("desktop geometry must have nonzero width and height");
+        }
+
+        let area = u64::from(requested.width) * u64::from(requested.height);
+        if area > MAX_DESKTOP_AREA {
+            anyhow::bail!(
+                "desktop geometry {}x{} exceeds maximum area of {MAX_DESKTOP_AREA} pixels",
+                requested.width,
+                requested.height
+            );
+        }
+
+        if !config.display.allow_resize {
+            match fixed_size {
+                Some(fixed_size) if fixed_size == requested => {}
+                Some(fixed_size) => anyhow::bail!(
+                    "desktop geometry {}x{} differs from fixed configured size {}x{} while display resizing is disabled",
+                    requested.width,
+                    requested.height,
+                    fixed_size.width,
+                    fixed_size.height
+                ),
+                None => anyhow::bail!("desktop resizing is disabled by configuration"),
+            }
+        }
+
+        if !config.display.allowed_resolutions.is_empty() {
+            let resolution = format!("{}x{}", requested.width, requested.height);
+            if !config.display.allowed_resolutions.contains(&resolution) {
+                anyhow::bail!(
+                    "desktop geometry {resolution} is not in display.allowed_resolutions"
+                );
+            }
+        }
+
+        Ok(requested)
+    }
+
     fn should_rotate_rdp_frame_180() -> bool {
         static ROTATE: AtomicBool = AtomicBool::new(false);
         static INIT: AtomicBool = AtomicBool::new(false);
@@ -608,99 +965,67 @@ impl DisplayChannelHandler {
     fn allowed_resize(&self, raw_width: u32, raw_height: u32) -> Option<(u16, u16)> {
         use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
 
-        if !self.config.display.allow_resize {
-            debug!("Dynamic resize disabled in config");
-            return None;
-        }
-
         let (width, height) = MonitorLayoutEntry::adjust_display_size(raw_width, raw_height);
-        let requested_area = u64::from(width) * u64::from(height);
-        const MAX_AREA: u64 = 3840 * 2400;
-        if requested_area > MAX_AREA {
-            warn!(
-                "Requested area {width}x{height} = {requested_area} exceeds max {MAX_AREA} pixels"
-            );
-            return None;
-        }
-
-        let width = width as u16;
-        let height = height as u16;
-        if !self.config.display.allowed_resolutions.is_empty() {
-            let target = format!("{width}x{height}");
-            if !self.config.display.allowed_resolutions.contains(&target) {
-                debug!("Resolution {target} not in allowed list");
-                return None;
+        let requested = DesktopSize {
+            width: u16::try_from(width).ok()?,
+            height: u16::try_from(height).ok()?,
+        };
+        match Self::validate_geometry_policy(&self.config, requested, None) {
+            Ok(accepted) => Some((accepted.width, accepted.height)),
+            Err(error) => {
+                debug!(%error, "Rejecting dynamic desktop resize");
+                None
             }
         }
-
-        Some((width, height))
     }
 
     async fn resize_managed_compositor(&self, width: u16, height: u16) -> Result<()> {
-        let output =
-            std::env::var("WRDP_HEADLESS_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".to_string());
-        let mode = format!("{width}x{height}");
-        let mut command = tokio::process::Command::new("wlr-randr");
-        command.args(["--output", output.as_str(), "--custom-mode", mode.as_str()]);
-
-        if let Some(socket) = &self.compositor_socket {
-            let runtime_dir = socket
-                .parent()
-                .context("managed compositor socket has no runtime directory")?;
-            let display = socket
-                .file_name()
-                .context("managed compositor socket has no display name")?;
-            command
-                .env("XDG_RUNTIME_DIR", runtime_dir)
-                .env("WAYLAND_DISPLAY", display);
-        } else {
-            command.env(
-                "WAYLAND_DISPLAY",
-                std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".to_string()),
-            );
-        }
-
-        let status = command.status().await?;
-
-        if !status.success() {
-            anyhow::bail!("wlr-randr exited with status {status}");
-        }
-        Ok(())
+        let control = self
+            .managed_compositor
+            .as_ref()
+            .context("dynamic resize is unavailable without managed compositor control")?;
+        control.resize(width, height).await
     }
 
-    fn crop_frame_to_size(frame: &VideoFrame, width: u16, height: u16) -> VideoFrame {
-        let target_width = u32::from(width).min(frame.width);
-        let target_height = u32::from(height).min(frame.height);
-
+    /// Return the same frame geometry with tightly packed rows.
+    ///
+    /// A frame whose geometry differs from the committed desktop is never
+    /// reshaped to fit it: a resize must instead be realized and committed by
+    /// the transaction below. This helper only removes source stride padding.
+    fn compact_frame(frame: &VideoFrame) -> VideoFrame {
         let bytes_per_pixel = frame.format.bytes_per_pixel() as u32;
-        let row_bytes = target_width * bytes_per_pixel;
+        let row_bytes = frame.width.saturating_mul(bytes_per_pixel);
 
-        // Encoders and damage detection consume tightly packed rows. Preserve
-        // the original allocation only when it is already compact; otherwise
-        // strip source-row padding even when no geometric crop is needed.
-        if target_width == frame.width && target_height == frame.height && frame.stride == row_bytes
-        {
+        if frame.stride == row_bytes {
             return frame.clone();
         }
-        // Keep cropped video frames compact. EGFX AVC/Planar encoders validate
-        // data_len == width * height * bytes_per_pixel; leaking stride padding
-        // here causes Android-sized frames such as 1596×768 to become 1600×768
-        // worth of bytes while still being advertised as 1596×768.
-        let target_stride = row_bytes;
-        let mut cropped = vec![0u8; (row_bytes * target_height) as usize];
 
-        for y in 0..target_height {
+        let required_len = (frame.height.saturating_sub(1) as usize)
+            .saturating_mul(frame.stride as usize)
+            .saturating_add(row_bytes as usize);
+        if frame.data.len() < required_len {
+            warn!(
+                frame_width = frame.width,
+                frame_height = frame.height,
+                stride = frame.stride,
+                data_len = frame.data.len(),
+                required_len,
+                "Cannot compact malformed frame"
+            );
+            return frame.clone();
+        }
+
+        let mut compact = vec![0u8; (row_bytes * frame.height) as usize];
+        for y in 0..frame.height {
             let src_offset = (y * frame.stride) as usize;
             let dst_offset = (y * row_bytes) as usize;
-            cropped[dst_offset..dst_offset + row_bytes as usize]
+            compact[dst_offset..dst_offset + row_bytes as usize]
                 .copy_from_slice(&frame.data[src_offset..src_offset + row_bytes as usize]);
         }
 
         let mut out = frame.clone();
-        out.width = target_width;
-        out.height = target_height;
-        out.stride = target_stride;
-        out.data = Arc::new(cropped);
+        out.stride = row_bytes;
+        out.data = Arc::new(compact);
         out.damage_regions.clear();
         out
     }
@@ -713,12 +1038,12 @@ impl DisplayChannelHandler {
         clippy::too_many_arguments,
         reason = "display handler needs pipeline components at construction"
     )]
-    pub async fn new_direct(
+    pub(crate) async fn new_direct(
         initial_width: u16,
         initial_height: u16,
         raw_rx: std::sync::mpsc::Receiver<crate::desktop::pipewire::frame::RawFrameData>,
         stream_info: Vec<StreamInfo>,
-        compositor_socket: Option<std::path::PathBuf>,
+        managed_compositor: Option<ManagedCompositorControl>,
         graphics_tx: Option<mpsc::Sender<GraphicsFrame>>,
         gfx_server_handle: Option<Arc<RwLock<Option<GfxServerHandle>>>>,
         gfx_handler_state: Option<Arc<RwLock<Option<HandlerState>>>>,
@@ -763,7 +1088,7 @@ impl DisplayChannelHandler {
             update_receiver,
             graphics_tx,
             stream_info,
-            compositor_socket,
+            managed_compositor,
             gfx_server_handle,
             gfx_handler_state,
             server_event_tx: Arc::new(RwLock::new(None)),
@@ -782,24 +1107,27 @@ impl DisplayChannelHandler {
         })
     }
 
-    /// Set input handler reference for reconnection notifications
-    ///
-    /// Must be called after input handler is created to enable reconnection reset.
+    /// Retain the input handler for display/input geometry coordination.
     pub async fn set_input_handler(
         &self,
         handler: Arc<crate::rdp::server::input_handler::InputChannelHandler>,
     ) {
         *self.input_handler.write().await = Some((*handler).clone());
-        info!("Input handler reference set for reconnection notifications");
+        if let Some(reporter) = self.health_reporter.read().await.clone() {
+            handler.set_health_reporter(reporter);
+        }
+        info!("Input handler reference set for display geometry coordination");
     }
 
-    /// Wire the health reporter so PipeWire stream state events propagate
-    /// to the session health monitor.
+    /// Wire the health reporter to graphics and input health producers.
     pub async fn set_health_reporter(
         &self,
         reporter: crate::rdp::session::supervision::SessionStatusReporter,
     ) {
-        *self.health_reporter.write().await = Some(reporter);
+        *self.health_reporter.write().await = Some(reporter.clone());
+        if let Some(input_handler) = self.input_handler.read().await.as_ref() {
+            input_handler.set_health_reporter(reporter);
+        }
     }
 
     /// Set clipboard manager reference for disconnect cleanup
@@ -965,30 +1293,6 @@ impl DisplayChannelHandler {
         }
 
         "ready" // Should not reach here if is_egfx_ready() is false
-    }
-
-    /// Update the desktop size
-    ///
-    /// Called when monitor configuration changes or client requests resize.
-    pub async fn update_size(&self, width: u16, height: u16) -> bool {
-        {
-            let mut size = self.size.write().await;
-            if !replace_desktop_size(&mut size, width, height) {
-                debug!(width, height, "Suppressing identical desktop resize");
-                return false;
-            }
-        }
-        info!(width, height, "Publishing desktop resize");
-
-        let update = DisplayUpdate::Resize(DesktopSize { width, height });
-        // Reconnection swaps this shared sender. Do not retain the mutex while
-        // waiting for channel capacity or the swap can be blocked indefinitely.
-        let sender = self.update_sender.lock().await.clone();
-        if let Err(e) = sender.send(update).await {
-            warn!("Failed to send resize update: {}", e);
-            return false;
-        }
-        true
     }
 
     /// Get a shared reference to the update sender for graphics drain task
@@ -1263,65 +1567,69 @@ impl DisplayChannelHandler {
                 }
 
                 // === CLIENT-INITIATED RESIZE ===
-                // Serialize core resize updates: each update causes an RDP
-                // Deactivate-Reactivate cycle in IronRDP. Distinct later requests
-                // remain queued while the client completes that transition.
+                // A mode command is only the first half of a resize. Do not
+                // advertise it until direct capture confirms the exact geometry.
+                let now = std::time::Instant::now();
+                if let Some(request) = handler
+                    .resize
+                    .lock()
+                    .ok()
+                    .and_then(|mut resize| resize.expire_realization(now))
+                {
+                    warn!(
+                        width = request.width,
+                        height = request.height,
+                        "Timed out waiting for compositor resize realization; scheduling retry"
+                    );
+                }
                 let latest_resize = handler
                     .resize
                     .lock()
                     .ok()
-                    .and_then(|mut resize| resize.take_ready(std::time::Instant::now()));
+                    .and_then(|mut resize| resize.take_ready(now));
                 if let Some(req) = latest_resize {
                     info!(
                         width = req.width,
                         height = req.height,
-                        "resize request applying"
+                        "issuing compositor resize"
                     );
-
-                    if let Err(e) = handler
+                    match handler
                         .resize_managed_compositor(req.width, req.height)
                         .await
                     {
-                        warn!(
-                            "Failed to resize managed compositor output; using frame crop fallback: {e}"
-                        );
-                    }
-                    let _published = handler.update_size(req.width, req.height).await;
-                    if let Ok(mut resize) = handler.resize.lock() {
-                        resize.mark_applied(req, std::time::Instant::now());
-                    }
-                    {
-                        let mut converter = handler.bitmap_converter.lock().await;
-                        *converter = BitmapConverter::new(req.width, req.height);
-                    }
-                    if let Some(ref mut detector) = damage_detector_opt {
-                        detector.invalidate();
-                    }
-
-                    // Force the next frame through a fresh EGFX ResetGraphics /
-                    // CreateSurface sequence so the server follows client-side
-                    // window resizes instead of merely recording them.
-                    video_encoder = None;
-                    egfx_sender = None;
-                    force_first_frame = true;
-                    handler
-                        .egfx_needs_init
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-
-                    let (stream_w, stream_h) = last_direct_geometry
-                        .unwrap_or((u32::from(req.width), u32::from(req.height)));
-                    let input_handler = handler.input_handler.read().await.clone();
-                    if let Some(input_handler) = input_handler
-                        && let Err(e) = input_handler
-                            .update_primary_stream_mapping(
-                                u32::from(req.width),
-                                u32::from(req.height),
-                                stream_w,
-                                stream_h,
-                            )
-                            .await
-                    {
-                        warn!("Failed to update direct input mapping after resize: {e}");
+                        Ok(()) => {
+                            let waiting_for_frame = handler
+                                .resize
+                                .lock()
+                                .map(|mut resize| {
+                                    resize.mark_command_succeeded(req, std::time::Instant::now())
+                                })
+                                .unwrap_or(false);
+                            if waiting_for_frame {
+                                debug!(
+                                    width = req.width,
+                                    height = req.height,
+                                    "compositor resize accepted; waiting for matching direct frame"
+                                );
+                            } else {
+                                debug!(
+                                    width = req.width,
+                                    height = req.height,
+                                    "compositor resize superseded before realization"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                width = req.width,
+                                height = req.height,
+                                %error,
+                                "Failed to resize managed compositor output; scheduling retry"
+                            );
+                            if let Ok(mut resize) = handler.resize.lock() {
+                                resize.mark_failed(req, std::time::Instant::now());
+                            }
+                        }
                     }
                 }
 
@@ -1380,47 +1688,126 @@ impl DisplayChannelHandler {
                     Some(f) => {
                         let frame_geometry = (f.width.max(1), f.height.max(1));
                         if last_direct_geometry != Some(frame_geometry) {
-                            let frame_w = frame_geometry.0.min(u32::from(u16::MAX)) as u16;
-                            let frame_h = frame_geometry.1.min(u32::from(u16::MAX)) as u16;
-                            let current_size = *handler.size.read().await;
-                            let target_w = current_size.width.min(frame_w).max(1);
-                            let target_h = current_size.height.min(frame_h).max(1);
-
+                            let committed = *handler.size.read().await;
                             info!(
-                                "portal-generic: direct frame geometry {}x{} -> desktop {}x{} / input stream {}x{}",
-                                f.width, f.height, target_w, target_h, frame_w, frame_h
+                                frame_width = f.width,
+                                frame_height = f.height,
+                                committed_width = committed.width,
+                                committed_height = committed.height,
+                                "Observed direct frame geometry; committed desktop remains unchanged until a matching resize transaction realizes"
                             );
-
-                            {
-                                let mut converter = handler.bitmap_converter.lock().await;
-                                *converter = BitmapConverter::new(target_w, target_h);
-                            }
-                            if let Some(ref mut detector) = damage_detector_opt {
-                                detector.invalidate();
-                            }
-
-                            // Force EGFX ResetGraphics/CreateSurface on the new size.
-                            video_encoder = None;
-                            egfx_sender = None;
-                            handler
-                                .egfx_needs_init
-                                .store(true, std::sync::atomic::Ordering::SeqCst);
-                            let _published = handler.update_size(target_w, target_h).await;
-
-                            let input_handler = handler.input_handler.read().await.clone();
-                            if let Some(input_handler) = input_handler
-                                && let Err(e) = input_handler
-                                    .update_primary_stream_mapping(
-                                        u32::from(target_w),
-                                        u32::from(target_h),
-                                        frame_geometry.0,
-                                        frame_geometry.1,
-                                    )
-                                    .await
-                            {
-                                warn!("Failed to update direct input mapping: {e}");
-                            }
                             last_direct_geometry = Some(frame_geometry);
+                        }
+
+                        // Commit only a frame that proves the compositor has
+                        // realized the exact requested mode. A differently-sized
+                        // frame is observation only; it cannot resize RDP state.
+                        let realized_resize = handler.resize.lock().ok().and_then(|resize| {
+                            resize.matches_realized_frame(
+                                frame_geometry.0,
+                                frame_geometry.1,
+                                std::time::Instant::now(),
+                            )
+                        });
+                        if let Some(request) = realized_resize {
+                            // Freeze the exact realized transaction before any
+                            // await points. A later request becomes the next
+                            // transaction; it cannot turn this direct frame into
+                            // an obsolete Resize publication.
+                            let commit_started = handler
+                                .resize
+                                .lock()
+                                .map(|mut resize| {
+                                    resize.begin_commit(request, std::time::Instant::now())
+                                })
+                                .unwrap_or(false);
+                            if !commit_started {
+                                debug!(
+                                    width = request.width,
+                                    height = request.height,
+                                    "Realized frame ignored because resize was superseded"
+                                );
+                            } else {
+                                let sender = handler.update_sender.lock().await.clone();
+                                match sender.reserve().await {
+                                    Ok(permit) => {
+                                        {
+                                            let mut size = handler.size.write().await;
+                                            *size = DesktopSize {
+                                                width: request.width,
+                                                height: request.height,
+                                            };
+                                        }
+                                        {
+                                            let mut converter =
+                                                handler.bitmap_converter.lock().await;
+                                            *converter =
+                                                BitmapConverter::new(request.width, request.height);
+                                        }
+                                        if let Some(ref mut detector) = damage_detector_opt {
+                                            detector.invalidate();
+                                        }
+
+                                        // The committed size is now the one used by the
+                                        // next EGFX surface and by frame encoding.
+                                        video_encoder = None;
+                                        egfx_sender = None;
+                                        force_first_frame = true;
+                                        handler
+                                            .egfx_needs_init
+                                            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+                                        // Update only the primary mapping; the input
+                                        // handler preserves all other monitors and streams.
+                                        let input_handler =
+                                            handler.input_handler.read().await.clone();
+                                        if let Some(input_handler) = input_handler
+                                            && let Err(error) = input_handler
+                                                .update_primary_stream_mapping(
+                                                    u32::from(request.width),
+                                                    u32::from(request.height),
+                                                    frame_geometry.0,
+                                                    frame_geometry.1,
+                                                )
+                                                .await
+                                        {
+                                            warn!(%error, "Failed to update realized direct input mapping");
+                                        }
+
+                                        // The reserve permit guarantees this final
+                                        // enqueue cannot fail after state commit.
+                                        permit.send(DisplayUpdate::Resize(DesktopSize {
+                                            width: request.width,
+                                            height: request.height,
+                                        }));
+                                        if let Ok(mut resize) = handler.resize.lock() {
+                                            if !resize
+                                                .mark_applied(request, std::time::Instant::now())
+                                            {
+                                                warn!(
+                                                    width = request.width,
+                                                    height = request.height,
+                                                    "Resize transaction lost its commit state"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            width = request.width,
+                                            height = request.height,
+                                            %error,
+                                            "Could not reserve display resize enqueue; scheduling retry"
+                                        );
+                                        if let Ok(mut resize) = handler.resize.lock() {
+                                            resize.mark_commit_failed(
+                                                request,
+                                                std::time::Instant::now(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         // Always cache the latest frame for replay on EGFX init.
@@ -1617,33 +2004,28 @@ impl DisplayChannelHandler {
                     }
                 };
 
-                // Use the client-negotiated desktop size for display encoding.
-                // PipeWire may keep producing the compositor/source size after a
-                // mobile client rotates or requests a smaller portrait/landscape
-                // desktop. If we encode/send the raw source dimensions while EGFX
-                // ResetGraphics/CreateSurface use the client size, Android RD
-                // Client renders corrupted pixels or a blank surface. Crop to the
-                // negotiated size before damage detection, encoder setup, surface
-                // creation, regions, and frame transmission.
-                let frame = {
-                    let size = handler.size.read().await;
-                    let target_w = size.width;
-                    let target_h = size.height;
-                    drop(size);
-
-                    if target_w > 0 && target_h > 0 {
-                        let cropped = Self::crop_frame_to_size(&frame, target_w, target_h);
-                        if cropped.width != frame.width || cropped.height != frame.height {
-                            info!(
-                                "📐 Cropped source frame {}×{} → client desktop {}×{} before encoding",
-                                frame.width, frame.height, cropped.width, cropped.height
-                            );
-                        }
-                        cropped
-                    } else {
-                        frame
-                    }
-                };
+                // Never reshape a capture frame to the negotiated desktop.
+                // A geometry mismatch means the compositor has not realized a
+                // requested mode (or capture changed independently), so wait for
+                // the matching transaction frame instead of publishing pixels for
+                // a desktop size the client was not given.
+                let committed_size = *handler.size.read().await;
+                if (frame.width, frame.height)
+                    != (
+                        u32::from(committed_size.width),
+                        u32::from(committed_size.height),
+                    )
+                {
+                    debug!(
+                        frame_width = frame.width,
+                        frame_height = frame.height,
+                        committed_width = committed_size.width,
+                        committed_height = committed_size.height,
+                        "Dropping frame whose geometry does not match committed desktop"
+                    );
+                    continue;
+                }
+                let frame = Self::compact_frame(&frame);
 
                 let frame = if Self::should_flip_rdp_frame_vertical() {
                     Self::flip_frame_vertical(&frame)
@@ -2495,15 +2877,7 @@ impl DisplayChannelHandler {
                 }
 
                 let convert_start = std::time::Instant::now();
-                let target_size = *handler.size.read().await;
-                let bitmap_frame =
-                    Self::crop_frame_to_size(&frame, target_size.width, target_size.height);
-                if bitmap_frame.width != frame.width || bitmap_frame.height != frame.height {
-                    debug!(
-                        "Cropping bitmap fallback frame: {}x{} -> {}x{}",
-                        frame.width, frame.height, bitmap_frame.width, bitmap_frame.height
-                    );
-                }
+                let bitmap_frame = Self::compact_frame(&frame);
                 // BGRx passthrough: PipeWire always produces BGRx, and when the
                 // client desktop also uses BGRx the BitmapConverter's generic path
                 // rejects BGRx→BGRx as unsupported. Build the BitmapUpdate directly
@@ -2696,48 +3070,46 @@ impl RdpServerDisplay for DisplayChannelHandler {
     }
 
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
-        let mut size = self.size.write().await;
-        info!(
-            "request_initial_size: client requested {}x{}, current server size {}x{}",
-            client_size.width, client_size.height, size.width, size.height
-        );
-
-        if let Some((width, height)) =
-            self.allowed_resize(u32::from(client_size.width), u32::from(client_size.height))
-        {
-            let accepted_size = DesktopSize { width, height };
-            let size_changed = *size != accepted_size;
-            if size_changed {
-                if let Err(e) = self.resize_managed_compositor(width, height).await {
-                    warn!(
-                        "Failed to apply initial compositor size; keeping server desktop size: {e}"
-                    );
-                    return *size;
-                }
-
-                // Let screencopy receive the compositor mode change and allocate
-                // a correctly-sized buffer before initial graphics negotiation completes.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The session binder has already selected and primed the compositor mode
+        // before IronRDP asks this question. Issuing a second mode command here
+        // races capture setup; the current size is therefore authoritative.
+        let authoritative = *self.size.read().await;
+        match Self::validate_geometry_policy(&self.config, client_size, Some(authoritative)) {
+            Ok(accepted) if accepted == authoritative => {
+                info!(
+                    width = authoritative.width,
+                    height = authoritative.height,
+                    "Accepted client initial desktop size matching binder realization"
+                );
             }
-
-            info!(
-                "Accepting client initial desktop size: {}x{} (was {}x{})",
-                width, height, size.width, size.height
-            );
-            *size = accepted_size;
-            *self.bitmap_converter.lock().await = BitmapConverter::new(width, height);
-        } else {
-            debug!(
-                "Keeping server initial desktop size: {}x{} (client requested {}x{})",
-                size.width, size.height, client_size.width, client_size.height
-            );
+            Ok(_) => {
+                debug!(
+                    requested_width = client_size.width,
+                    requested_height = client_size.height,
+                    authoritative_width = authoritative.width,
+                    authoritative_height = authoritative.height,
+                    "Keeping binder-authoritative initial desktop size"
+                );
+            }
+            Err(error) => {
+                debug!(
+                    %error,
+                    requested_width = client_size.width,
+                    requested_height = client_size.height,
+                    authoritative_width = authoritative.width,
+                    authoritative_height = authoritative.height,
+                    "Rejected invalid initial desktop size"
+                );
+            }
         }
-        *size
+        authoritative
     }
 
-    /// Called once per connection to establish the update stream.
-    /// If an earlier connection consumed the receiver, we create a fresh channel
-    /// to allow reconnection without requiring server restart.
+    /// Called to establish the update stream.
+    ///
+    /// IronRDP calls this again during same-connection Deactivate-Reactivate
+    /// after a desktop resize. A consumed receiver is thus a new display
+    /// generation, not evidence of a physical client reconnection.
     #[expect(
         clippy::expect_used,
         reason = "mutex poisoning is unrecoverable; receiver guaranteed after reset"
@@ -2745,20 +3117,21 @@ impl RdpServerDisplay for DisplayChannelHandler {
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
         let mut receiver_option = self.update_receiver.lock().await;
 
-        // If receiver was already taken by an earlier connection, create a new channel
+        // A resize reactivation consumed the prior receiver; create its next
+        // display generation without treating this as a client reconnect.
         if receiver_option.is_none() {
-            debug!("Display updates channel exhausted, creating new channel for reconnection");
+            debug!("Display updates receiver consumed; creating channel for reactivation");
             let (new_sender, new_receiver) = mpsc::channel(64);
             *self.update_sender.lock().await = new_sender;
             *receiver_option = Some(new_receiver);
 
-            // CRITICAL: Reset ALL EGFX state for new client
-            // The new client needs fresh EGFX negotiation + ResetGraphics + CreateSurface.
+            // Reset EGFX generation state for this reactivation so the client
+            // receives fresh ResetGraphics + CreateSurface.
             // Without these resets:
             // 1. egfx_needs_init=false would skip encoder/surface creation
             // 2. stale gfx_handler_state.is_ready=true would skip waiting for new EGFX channel
             // 3. stale gfx_server_handle would have old surface (create_surface returns None)
-            info!("Resetting EGFX state for reconnecting client");
+            info!("Resetting EGFX state for display reactivation");
             self.egfx_needs_init
                 .store(true, std::sync::atomic::Ordering::SeqCst);
 
@@ -2787,18 +3160,6 @@ impl RdpServerDisplay for DisplayChannelHandler {
                 _ => {
                     debug!("BitmapConverter locked by pipeline, will reset on next frame");
                 }
-            }
-
-            // Notify input handler about reconnection
-            // The input handler is shared across connections but needs to reset internal state
-            // (keyboard modifiers, mouse button state) when a new client connects
-            if let Some(ref handler) = *self.input_handler.read().await {
-                handler.notify_reconnection().await;
-            }
-
-            // On reconnect, the clipboard provider manages its own state cleanup.
-            if self.clipboard_manager.read().await.is_some() {
-                info!("Reconnection detected - clipboard provider handles state reset");
             }
         }
 
@@ -2852,6 +3213,11 @@ impl RdpServerDisplay for DisplayChannelHandler {
 
         let (raw_w, raw_h) = monitor.dimensions();
 
+        if self.managed_compositor.is_none() {
+            warn!("Ignoring dynamic resize without managed compositor control");
+            return;
+        }
+
         let Some((new_w, new_h)) = self.allowed_resize(raw_w, raw_h) else {
             return;
         };
@@ -2870,8 +3236,9 @@ impl RdpServerDisplay for DisplayChannelHandler {
                 info!(
                     width = new_w,
                     height = new_h,
-                    queued = resize.queued.len(),
-                    "resize request queued"
+                    pending = ?resize.pending,
+                    in_flight = ?resize.in_flight,
+                    "latest resize request recorded"
                 );
             }
             Err(error) => error!("Resize coordinator lock poisoned: {error}"),
@@ -2893,7 +3260,7 @@ impl Clone for DisplayChannelHandler {
             update_receiver: Arc::clone(&self.update_receiver),
             graphics_tx: self.graphics_tx.clone(),
             stream_info: self.stream_info.clone(),
-            compositor_socket: self.compositor_socket.clone(),
+            managed_compositor: self.managed_compositor.clone(),
             // EGFX fields
             gfx_server_handle: Arc::clone(&self.gfx_server_handle),
             gfx_handler_state: Arc::clone(&self.gfx_handler_state),
@@ -2959,6 +3326,25 @@ mod tests {
     }
 
     #[test]
+    fn wlr_randr_current_mode_parser_requires_the_exact_current_mode() {
+        assert!(wlr_randr_reports_current_mode(
+            b"HEADLESS-1 \"Headless output\"\n  1280x720 px, 60.000000 Hz (current)\n",
+            1280,
+            720,
+        ));
+        assert!(!wlr_randr_reports_current_mode(
+            b"  1280x720 px, 60.000000 Hz\n  1920x1080 px, 60.000000 Hz (current)\n",
+            1280,
+            720,
+        ));
+        assert!(!wlr_randr_reports_current_mode(
+            b"  1280x7200 px, 60.000000 Hz (current)\n",
+            1280,
+            720,
+        ));
+    }
+
+    #[test]
     fn explicit_bitmap_policy_bypasses_egfx_without_timeout() {
         let mut config = crate::config::Config::default();
         assert!(!starts_in_bitmap_mode(&config));
@@ -2969,71 +3355,8 @@ mod tests {
     }
 
     #[test]
-    fn identical_desktop_size_is_not_published_twice() {
-        let mut size = DesktopSize {
-            width: 1280,
-            height: 720,
-        };
-        assert!(replace_desktop_size(&mut size, 864, 634));
-        assert_eq!((size.width, size.height), (864, 634));
-        assert!(!replace_desktop_size(&mut size, 864, 634));
-    }
-
-    #[test]
-    fn resize_coordinator_preserves_distinct_requests_across_guard() {
+    fn resize_coordinator_keeps_only_the_latest_request() {
         let start = std::time::Instant::now();
-        let mut resize = ResizeCoordinator::new(1280, 720);
-        for (width, height) in [(864, 634), (1376, 960), (1280, 720), (1920, 1080)] {
-            resize.request(ResizeRequest { width, height });
-        }
-
-        let first = resize.take_ready(start).unwrap();
-        assert_eq!(
-            first,
-            ResizeRequest {
-                width: 864,
-                height: 634
-            }
-        );
-        resize.mark_applied(first, start);
-        assert!(
-            resize
-                .take_ready(start + std::time::Duration::from_secs(1))
-                .is_none()
-        );
-
-        let mut applied = vec![first];
-        for seconds in [2, 4, 6] {
-            let now = start + std::time::Duration::from_secs(seconds);
-            let request = resize.take_ready(now).unwrap();
-            resize.mark_applied(request, now);
-            applied.push(request);
-        }
-        assert_eq!(
-            applied,
-            vec![
-                ResizeRequest {
-                    width: 864,
-                    height: 634
-                },
-                ResizeRequest {
-                    width: 1376,
-                    height: 960
-                },
-                ResizeRequest {
-                    width: 1280,
-                    height: 720
-                },
-                ResizeRequest {
-                    width: 1920,
-                    height: 1080
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn return_to_applied_size_is_retained_behind_pending_requests() {
         let mut resize = ResizeCoordinator::new(1280, 720);
         resize.request(ResizeRequest {
             width: 864,
@@ -3043,64 +3366,117 @@ mod tests {
             width: 1376,
             height: 960,
         });
-        resize.request(ResizeRequest {
-            width: 1280,
-            height: 720,
-        });
-        assert_eq!(resize.queued.len(), 3);
+
         assert_eq!(
-            resize.queued.back().copied(),
+            resize.take_ready(start),
             Some(ResizeRequest {
-                width: 1280,
-                height: 720
+                width: 1376,
+                height: 960
             })
         );
+        assert!(resize.pending.is_none());
     }
 
     #[test]
-    fn resize_coordinator_coalesces_only_consecutive_duplicates() {
+    fn resize_coordinator_retries_a_failed_mode_command_after_delay() {
+        let start = std::time::Instant::now();
+        let request = ResizeRequest {
+            width: 1376,
+            height: 960,
+        };
         let mut resize = ResizeCoordinator::new(1280, 720);
-        resize.request(ResizeRequest {
-            width: 1280,
-            height: 720,
-        });
-        resize.request(ResizeRequest {
-            width: 864,
-            height: 634,
-        });
-        resize.request(ResizeRequest {
-            width: 864,
-            height: 634,
-        });
-        resize.request(ResizeRequest {
-            width: 1280,
-            height: 720,
-        });
-        assert_eq!(resize.queued.len(), 2);
-        assert_eq!(
-            resize.queued[0],
-            ResizeRequest {
-                width: 864,
-                height: 634
-            }
+        resize.request(request);
+        assert_eq!(resize.take_ready(start), Some(request));
+        assert!(resize.mark_failed(request, start));
+        assert!(
+            resize
+                .take_ready(start + ResizeCoordinator::RETRY_DELAY / 2)
+                .is_none()
         );
         assert_eq!(
-            resize.queued[1],
-            ResizeRequest {
-                width: 1280,
-                height: 720
-            }
+            resize.take_ready(start + ResizeCoordinator::RETRY_DELAY),
+            Some(request)
         );
     }
 
     #[test]
-    fn resize_coordinator_is_bounded_under_drag_bursts() {
+    fn superseded_inflight_resize_cannot_be_applied() {
+        let start = std::time::Instant::now();
+        let first = ResizeRequest {
+            width: 864,
+            height: 634,
+        };
+        let latest = ResizeRequest {
+            width: 1376,
+            height: 960,
+        };
         let mut resize = ResizeCoordinator::new(1280, 720);
-        for width in 800..900 {
-            resize.request(ResizeRequest { width, height: 600 });
-        }
-        assert_eq!(resize.queued.len(), ResizeCoordinator::CAPACITY);
-        assert_eq!(resize.queued.back().unwrap().width, 899);
+        resize.request(first);
+        assert_eq!(resize.take_ready(start), Some(first));
+        assert!(resize.mark_command_succeeded(first, start));
+        resize.request(latest);
+
+        assert!(
+            resize
+                .matches_realized_frame(864, 634, start + std::time::Duration::from_millis(1))
+                .is_none()
+        );
+        assert!(!resize.mark_applied(first, start));
+        assert_eq!(resize.take_ready(start), Some(latest));
+    }
+
+    #[test]
+    fn exact_realized_frame_commits_resize() {
+        let start = std::time::Instant::now();
+        let request = ResizeRequest {
+            width: 1376,
+            height: 960,
+        };
+        let mut resize = ResizeCoordinator::new(1280, 720);
+        resize.request(request);
+        assert_eq!(resize.take_ready(start), Some(request));
+        assert!(resize.mark_command_succeeded(request, start));
+        assert!(
+            resize
+                .matches_realized_frame(1375, 960, start + std::time::Duration::from_millis(1))
+                .is_none()
+        );
+        assert_eq!(
+            resize.matches_realized_frame(1376, 960, start + std::time::Duration::from_millis(1)),
+            Some(request)
+        );
+        assert!(resize.begin_commit(request, start));
+        assert!(resize.mark_applied(request, start));
+        assert_eq!(resize.applied, request);
+    }
+
+    #[test]
+    fn resize_coordinator_honors_post_reactivation_guard() {
+        let start = std::time::Instant::now();
+        let first = ResizeRequest {
+            width: 864,
+            height: 634,
+        };
+        let next = ResizeRequest {
+            width: 1376,
+            height: 960,
+        };
+        let mut resize = ResizeCoordinator::new(1280, 720);
+        resize.request(first);
+        assert_eq!(resize.take_ready(start), Some(first));
+        assert!(resize.mark_command_succeeded(first, start));
+        assert!(resize.begin_commit(first, start));
+        assert!(resize.mark_applied(first, start));
+        resize.request(next);
+        assert!(
+            resize
+                .take_ready(start + ResizeCoordinator::REACTIVATION_GUARD / 2)
+                .is_none()
+        );
+        assert_eq!(
+            resize.take_ready(start + ResizeCoordinator::REACTIVATION_GUARD),
+            Some(next)
+        );
     }
 
     #[tokio::test]
@@ -3124,7 +3500,7 @@ mod tests {
     }
 
     #[test]
-    fn compacting_frame_removes_source_stride_padding() {
+    fn compacting_frame_removes_source_stride_padding_without_changing_geometry() {
         let frame = VideoFrame {
             frame_id: 1,
             pts: 0,
@@ -3144,8 +3520,9 @@ mod tests {
             flags: crate::desktop::pipewire::frame::FrameFlags::new(),
         };
 
-        let compact = DisplayChannelHandler::crop_frame_to_size(&frame, 2, 2);
+        let compact = DisplayChannelHandler::compact_frame(&frame);
 
+        assert_eq!((compact.width, compact.height), (2, 2));
         assert_eq!(compact.stride, 8);
         assert_eq!(
             compact.data.as_slice(),

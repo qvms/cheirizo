@@ -24,9 +24,9 @@ TCP accept
   -> PAM or configured-password validation
   -> bind authenticated user and negotiated desktop size to a session
   -> resize the managed output before capture
-  -> construct display, input and dynamic-channel handlers
-  -> stream until disconnect or session failure
-  -> close channels and release connection-owned resources
+  -> construct display, input and dynamic-channel handlers transactionally
+  -> stream until disconnect, timeout or supervised session failure
+  -> stop supervision, close channels, join backend workers and release session ownership
 ```
 
 Authentication and session creation stay separate: validating credentials must not start a compositor. The post-auth binder is the hand-off point.
@@ -35,13 +35,24 @@ Authentication and session creation stay separate: validating credentials must n
 
 The session manager starts a managed Wayland compositor for each user. The server attaches through the desktop backend:
 
-- The managed compositor output is set to the negotiated desktop size before capture begins, including when a healthy session is reused.
+- The initial negotiated geometry passes the same allowlist, fixed-size and maximum-area policy as later resize requests. The managed compositor output is set and verified before capture begins, including when a healthy session is reused.
 - The managed compositor supplies frames through a direct channel, using DMA-BUF when the renderer and driver permit it and SHM otherwise.
 - PipeWire provides audio capture and remains available to portal-backed capture paths.
-- Wayland or EIS interfaces inject keyboard and pointer input. Advanced Input owns mouse delivery while its DVC is active; IronRDP suppresses overlapping core mouse events for that connection.
-- data-control interfaces provide clipboard access.
+- Wayland or EIS interfaces inject keyboard and pointer input. Advanced Input owns mouse delivery while its DVC is active; IronRDP suppresses overlapping core mouse events for that connection. The ordered input queue is bounded; losing a release or synchronization event invalidates the connection instead of risking stuck state.
+- data-control interfaces provide clipboard access. View-only sessions create neither virtual input nor clipboard backends and advertise neither path to RDP clients.
 
-The server tears down an RDP connection when its managed desktop disappears. It does not fall back to another user's desktop or an unrelated host session. A frame crop exists only as protection against a transient capture race; normal operation requires compositor output, capture, RDP desktop and input mapping to use the same geometry.
+The server tears down an RDP connection when its managed desktop, capture or input path becomes permanently invalid. It does not fall back to another user's desktop or an unrelated host session. Resize is transactional: a requested mode is not published to RDP or input mapping until capture produces that exact geometry; newer requests supersede older ones.
+
+## Session trust boundary
+
+User runtime artifacts and privileged lifecycle authority are separate:
+
+- `/run/user/<uid>/wrdp` is owned by the authenticated account and contains the Wayland socket and component logs.
+- `/run/wrdp/sesman/<uid>` is owned by the daemon identity and contains the advisory lock and lifecycle state.
+
+The daemon rejects symlinked or wrongly owned runtime components before privileged access. Compositor control runs under the authenticated UID/GID, not root. Persisted process authority includes the boot ID, UID, PID start ticks and process group; destructive signalling requires every field to match. Legacy user-owned registries are never trusted as signal authority.
+
+Startup reconciles stale client counts and persisted idle deadlines. A daemon-wide periodic pass performs only overdue idle cleanup and never rewrites live client ownership.
 
 ## Display path
 

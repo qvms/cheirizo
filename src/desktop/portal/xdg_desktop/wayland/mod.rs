@@ -28,6 +28,7 @@ use data_control::DataControlManager;
 pub use data_control::{ClipboardCommand, SharedClipboardState};
 pub use dispatch::{OutputInfo, WaylandState};
 pub use globals::AvailableProtocols;
+use nix::sys::socket::{getsockopt, sockopt};
 use wayland_client::{
     Connection, EventQueue, QueueHandle,
     globals::{GlobalList, registry_queue_init},
@@ -140,6 +141,29 @@ impl std::fmt::Debug for CaptureCommand {
 /// Result type for Wayland operations.
 pub type Result<T> = std::result::Result<T, PortalError>;
 
+/// Verify that a connected Unix socket's peer has the expected Linux UID.
+///
+/// `SO_PEERCRED` identifies the process at the other end of this already
+/// connected socket, avoiding any trust decision based solely on the socket
+/// path or its filesystem metadata.
+pub fn verify_unix_peer_uid(stream: &UnixStream, expected_uid: u32) -> Result<()> {
+    let actual_uid = getsockopt(stream, sockopt::PeerCredentials)
+        .map_err(|error| {
+            PortalError::Config(format!(
+                "Failed to read Unix socket peer credentials: {error}"
+            ))
+        })?
+        .uid();
+
+    if actual_uid != expected_uid {
+        return Err(PortalError::PermissionDenied(format!(
+            "Wayland socket peer UID mismatch: expected {expected_uid}, got {actual_uid}"
+        )));
+    }
+
+    Ok(())
+}
+
 /// Shared Wayland client connection.
 ///
 /// Main entry point for Wayland protocol interactions across portal backend
@@ -196,14 +220,31 @@ impl WaylandConnection {
     }
 
     /// Connect to an explicit Wayland Unix socket path.
+    ///
+    /// This compatibility entry point does not constrain the peer UID. Managed
+    /// sessions should use [`Self::connect_to_path_for_uid`] instead.
     pub fn connect_to_path(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
+        Self::connect_to_path_inner(path.as_ref(), None)
+    }
+
+    /// Connect to an explicit Wayland Unix socket path owned by `expected_uid`.
+    ///
+    /// The connected socket's peer credentials are verified before its file
+    /// descriptor is handed to the Wayland client library.
+    pub fn connect_to_path_for_uid(path: impl AsRef<Path>, expected_uid: u32) -> Result<Self> {
+        Self::connect_to_path_inner(path.as_ref(), Some(expected_uid))
+    }
+
+    fn connect_to_path_inner(path: &Path, expected_uid: Option<u32>) -> Result<Self> {
         tracing::info!("Connecting to Wayland compositor");
         let stream = UnixStream::connect(path).map_err(|e| {
             PortalError::Config(format!(
                 "Failed to connect to configured Wayland socket: {e}"
             ))
         })?;
+        if let Some(expected_uid) = expected_uid {
+            verify_unix_peer_uid(&stream, expected_uid)?;
+        }
         let connection = Connection::from_socket(stream).map_err(|e| {
             PortalError::Config(format!(
                 "Failed to initialize Wayland connection from {}: {e}",
@@ -893,5 +934,39 @@ impl WaylandConnection {
             shared_clipboard,
             handle,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        os::unix::net::{UnixListener, UnixStream},
+        thread,
+    };
+
+    use nix::unistd::Uid;
+
+    use super::verify_unix_peer_uid;
+
+    #[test]
+    fn unix_peer_uid_verification_accepts_current_uid_and_rejects_another() {
+        let directory = tempfile::tempdir().expect("create temporary socket directory");
+        let socket_path = directory.path().join("wayland-peer-uid.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind Unix listener");
+        let client_path = socket_path.clone();
+        let client = thread::spawn(move || UnixStream::connect(client_path));
+        let (stream, _) = listener.accept().expect("accept Unix connection");
+        let _client = client
+            .join()
+            .expect("Unix client thread panicked")
+            .expect("connect Unix client");
+
+        let current_uid = Uid::effective().as_raw();
+        assert!(verify_unix_peer_uid(&stream, current_uid).is_ok());
+
+        let other_uid = current_uid
+            .checked_add(1)
+            .unwrap_or_else(|| current_uid - 1);
+        assert!(verify_unix_peer_uid(&stream, other_uid).is_err());
     }
 }

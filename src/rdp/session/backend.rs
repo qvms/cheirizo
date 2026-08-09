@@ -64,6 +64,21 @@ pub trait SessionHandle: Send + Sync {
     /// Provide stream info from a non-local video source.
     fn set_streams(&self, _streams: Vec<StreamInfo>) {}
 
+    // === Deterministic Teardown ===
+
+    /// Deterministically tear down this session's resources.
+    ///
+    /// Idempotent: repeated calls are no-ops after the first successful call.
+    /// Backends that own compositor resources should destroy input contexts and
+    /// capture sessions/streams, signal and join their background loops without
+    /// blocking the async runtime, and report the session closed exactly once.
+    ///
+    /// Default: no-op for backends that don't need explicit teardown. `Drop`
+    /// remains a best-effort stop path and must not duplicate the closed report.
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+
     // === Clipboard Support ===
 
     /// Describes how this backend provides clipboard functionality.

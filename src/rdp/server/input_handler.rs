@@ -8,7 +8,7 @@
 //! both are driven by incoming client input events.
 
 use std::sync::{
-    Arc,
+    Arc, RwLock as StdRwLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -74,8 +74,14 @@ impl CjkPasteBuffer {
 
 use crate::rdp::channels::clipboard::provider::ClipboardProvider;
 use crate::rdp::channels::graphics::egfx::channel::HandlerState;
-use crate::rdp::channels::input::{
-    CoordinateTransformer, InputError, KeyboardHandler, MonitorInfo, MouseButton, MouseHandler,
+use crate::rdp::{
+    channels::input::{
+        CoordinateTransformer, InputError, KeyboardHandler, MonitorInfo, MouseButton, MouseHandler,
+    },
+    session::{
+        backend::StreamInfo,
+        supervision::{SessionStatusEvent, SessionStatusReporter},
+    },
 };
 
 /// Map a Unicode code point to an evdev keycode and whether Shift is needed.
@@ -301,6 +307,98 @@ fn input_event_is_droppable(event: &InputEvent) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePressureAction {
+    Drop,
+    FailConnection,
+}
+
+fn queue_pressure_action(event: &InputEvent) -> QueuePressureAction {
+    if input_event_is_droppable(event) {
+        QueuePressureAction::Drop
+    } else {
+        QueuePressureAction::FailConnection
+    }
+}
+
+/// Number of consecutive injection failures that promotes a transient fault to
+/// a permanent one. Below this the worker keeps retrying and logs on powers of
+/// two; a single success resets the count and recovers.
+const INPUT_FAILURE_THRESHOLD: u64 = 32;
+
+/// Whether a run of consecutive injection failures has reached the permanent
+/// threshold, meaning the worker must report `InputFailed` and exit.
+///
+/// Pure so the threshold policy can be unit-tested without a live backend.
+fn injection_failures_are_terminal(consecutive_failures: u64) -> bool {
+    consecutive_failures >= INPUT_FAILURE_THRESHOLD
+}
+
+/// Report a terminal input failure to supervision at most once.
+///
+/// Shared by the queue-overflow path and the injection-failure path so both
+/// converge on a single permanent `InputFailed` event. Only fires once a
+/// reporter is attached and the connection is already marked terminal.
+fn report_input_failed_once(
+    terminal_overflow: &AtomicBool,
+    overflow_reported: &AtomicBool,
+    health_reporter: &StdRwLock<Option<SessionStatusReporter>>,
+    reason: &str,
+) {
+    if !terminal_overflow.load(Ordering::Acquire) || overflow_reported.load(Ordering::Acquire) {
+        return;
+    }
+    let reporter = health_reporter
+        .read()
+        .ok()
+        .and_then(|reporter| reporter.clone());
+    if let Some(reporter) = reporter
+        && overflow_reported
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        reporter.report(SessionStatusEvent::InputFailed {
+            reason: reason.to_string(),
+            permanent: true,
+        });
+    }
+}
+
+/// Apply a primary resize without destroying the rest of the desktop topology.
+///
+/// The monitor's desktop dimensions describe the RDP-visible region, while its
+/// stream dimensions describe the corresponding capture/input target. Positions,
+/// identities, non-primary monitors, and non-primary streams remain unchanged.
+fn update_primary_topology(
+    monitors: &mut [MonitorInfo],
+    streams: &mut [StreamInfo],
+    primary_stream_id: u32,
+    rdp_width: u32,
+    rdp_height: u32,
+    stream_width: u32,
+    stream_height: u32,
+) -> Result<(), InputError> {
+    let primary_monitor = monitors
+        .iter()
+        .position(|monitor| monitor.is_primary)
+        .ok_or_else(|| {
+            InputError::InvalidMonitorConfig("no primary monitor configured".to_string())
+        })?;
+    let primary_stream = streams
+        .iter()
+        .position(|stream| stream.node_id == primary_stream_id)
+        .ok_or(InputError::MonitorNotFound(primary_stream_id))?;
+
+    monitors[primary_monitor].width = rdp_width;
+    monitors[primary_monitor].height = rdp_height;
+    monitors[primary_monitor].stream_width = stream_width;
+    monitors[primary_monitor].stream_height = stream_height;
+    streams[primary_stream].width = stream_width;
+    streams[primary_stream].height = stream_height;
+
+    Ok(())
+}
+
 /// Input handler that bridges IronRDP events to runtime input injection.
 ///
 /// Receives keyboard and mouse events from RDP clients and injects them into
@@ -318,12 +416,19 @@ pub struct InputChannelHandler {
     /// Coordinate transformer for multi-monitor support (pub for multiplexer access)
     pub coordinate_transformer: Arc<Mutex<CoordinateTransformer>>,
 
+    /// Authoritative monitor topology used to rebuild the coordinate transformer.
+    monitors: Arc<Mutex<Vec<MonitorInfo>>>,
+
     /// Primary stream node ID used for pointer/input injection routing.
     primary_stream_id: u32,
 
-    /// Ordered input event queue plus a soft backlog bound.
-    input_tx: mpsc::UnboundedSender<InputEvent>,
-    queued_events: Arc<std::sync::atomic::AtomicUsize>,
+    /// Ordered, bounded input event queue.
+    input_tx: mpsc::Sender<InputEvent>,
+
+    /// A lost release or synchronization event makes the connection unsafe.
+    terminal_overflow: Arc<AtomicBool>,
+    overflow_reported: Arc<AtomicBool>,
+    health_reporter: Arc<StdRwLock<Option<SessionStatusReporter>>>,
 
     /// Display update channel used only for Android RD Client pointer workaround PDUs.
     pointer_update_tx: Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
@@ -338,15 +443,6 @@ pub struct InputChannelHandler {
     first_keyboard_event: Arc<AtomicBool>,
     first_mouse_event: Arc<AtomicBool>,
     first_mouse_button_event: Arc<AtomicBool>,
-
-    /// Configured scancode/XKB layout, preserved across reconnect resets.
-    keyboard_layout: String,
-
-    /// Whether CJK clipboard-paste fallback is enabled (from config)
-    cjk_paste_enabled: bool,
-
-    /// Clipboard provider for writing text during CJK paste fallback
-    clipboard_provider: Option<Arc<dyn ClipboardProvider>>,
 }
 
 impl InputChannelHandler {
@@ -354,10 +450,10 @@ impl InputChannelHandler {
         session_handle: Arc<dyn crate::rdp::session::SessionHandle>,
         monitors: Vec<MonitorInfo>,
         primary_stream_id: u32,
-        input_tx: mpsc::UnboundedSender<InputEvent>,
+        legacy_input_tx: mpsc::UnboundedSender<InputEvent>,
         pointer_update_tx: Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
         gfx_handler_state: Option<Arc<RwLock<Option<HandlerState>>>>,
-        mut input_rx: mpsc::UnboundedReceiver<InputEvent>,
+        legacy_input_rx: mpsc::UnboundedReceiver<InputEvent>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         keyboard_layout: &str,
         cjk_paste_enabled: bool,
@@ -372,15 +468,30 @@ impl InputChannelHandler {
         let keyboard_handler = Arc::new(Mutex::new(keyboard));
         let mouse_handler = Arc::new(Mutex::new(MouseHandler::new()));
 
-        let coordinate_transformer = Arc::new(Mutex::new(CoordinateTransformer::new(monitors)?));
+        let coordinate_transformer =
+            Arc::new(Mutex::new(CoordinateTransformer::new(monitors.clone())?));
+        let monitors = Arc::new(Mutex::new(monitors));
+
+        // Keep the existing constructor ABI while making the callback-facing
+        // queue bounded. The legacy pair is never used for event transport.
+        drop(legacy_input_tx);
+        drop(legacy_input_rx);
+        const INPUT_QUEUE_CAPACITY: usize = 4096;
+        let (input_tx, mut input_rx) = mpsc::channel(INPUT_QUEUE_CAPACITY);
+        let terminal_overflow = Arc::new(AtomicBool::new(false));
+        let overflow_reported = Arc::new(AtomicBool::new(false));
+        let health_reporter: Arc<StdRwLock<Option<SessionStatusReporter>>> =
+            Arc::new(StdRwLock::new(None));
+        let terminal_overflow_task = Arc::clone(&terminal_overflow);
+        let overflow_reported_task = Arc::clone(&overflow_reported);
+        let health_reporter_task = Arc::clone(&health_reporter);
 
         debug!(
             "Input handler using PipeWire stream node ID: {}",
             primary_stream_id
         );
 
-        // Start input batching task (10ms windows for responsive typing)
-        // Receives from multiplexer input queue, batches, and sends to Portal
+        // Receive synchronous callbacks in FIFO order and inject them asynchronously.
         let session_handle_clone = Arc::clone(&session_handle);
         let keyboard_clone = Arc::clone(&keyboard_handler);
         let mouse_clone = Arc::clone(&mouse_handler);
@@ -390,8 +501,6 @@ impl InputChannelHandler {
         let pointer_update_tx_task = pointer_update_tx.clone();
         let gfx_handler_state_task = gfx_handler_state.clone();
         let pointer_shape_sent = Arc::new(AtomicBool::new(false));
-        let queued_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let queued_events_task = Arc::clone(&queued_events);
         let pointer_shape_sent_task = Arc::clone(&pointer_shape_sent);
 
         tokio::spawn(async move {
@@ -403,7 +512,9 @@ impl InputChannelHandler {
                 tokio::select! {
                     event = input_rx.recv() => {
                         let Some(event) = event else { break };
-                        queued_events_task.fetch_sub(1, Ordering::Relaxed);
+                        if terminal_overflow_task.load(Ordering::Acquire) {
+                            break;
+                        }
                         let result = match event {
                             InputEvent::Keyboard(event) => {
                                 Self::handle_keyboard_event_impl(
@@ -443,6 +554,21 @@ impl InputChannelHandler {
                                 if count == 1 || count.is_power_of_two() {
                                     warn!(kind, count, %error, "Portal input injection failed");
                                 }
+                                if injection_failures_are_terminal(count) {
+                                    error!(
+                                        kind,
+                                        count,
+                                        "Input injection failed permanently; failing connection"
+                                    );
+                                    terminal_overflow_task.store(true, Ordering::Release);
+                                    report_input_failed_once(
+                                        &terminal_overflow_task,
+                                        &overflow_reported_task,
+                                        &health_reporter_task,
+                                        "input injection failed on every attempt past the permanent-failure threshold",
+                                    );
+                                    break;
+                                }
                             }
                         }
                     }
@@ -458,78 +584,78 @@ impl InputChannelHandler {
             keyboard_handler,
             mouse_handler,
             coordinate_transformer,
+            monitors,
             primary_stream_id,
             input_tx,
-            queued_events,
+            terminal_overflow,
+            overflow_reported,
+            health_reporter,
             pointer_update_tx,
             gfx_handler_state,
             pointer_shape_sent,
             first_keyboard_event: Arc::new(AtomicBool::new(false)),
             first_mouse_event: Arc::new(AtomicBool::new(false)),
             first_mouse_button_event: Arc::new(AtomicBool::new(false)),
-            keyboard_layout: keyboard_layout.to_string(),
-            cjk_paste_enabled,
-            clipboard_provider,
         })
     }
 
-    /// Notify input handler that client reconnected
-    ///
-    /// Resets internal state to handle new client connection.
-    /// Call this when reconnection is detected (e.g., display_updates channel recreated).
     fn enqueue_input(&self, event: InputEvent, label: &'static str) {
-        const SOFT_LIMIT: usize = 4096;
-        let queued = self.queued_events.load(Ordering::Relaxed);
-        if queued >= SOFT_LIMIT && input_event_is_droppable(&event) {
-            trace!(label, queued, "Dropping coalescible input under backlog");
+        if self.terminal_overflow.load(Ordering::Acquire) {
+            trace!(label, "Ignoring input after terminal queue failure");
             return;
         }
-        self.queued_events.fetch_add(1, Ordering::Relaxed);
-        if let Err(error) = self.input_tx.send(event) {
-            self.queued_events.fetch_sub(1, Ordering::Relaxed);
-            error!(%error, "Failed to queue {label} input event");
+
+        match self.input_tx.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                match queue_pressure_action(&event) {
+                    QueuePressureAction::Drop => {
+                        trace!(label, "Dropping coalescible input under queue pressure");
+                    }
+                    QueuePressureAction::FailConnection => self.fail_input_connection(
+                        "bounded input queue overflowed before a non-droppable release or synchronize event",
+                    ),
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.fail_input_connection("bounded input queue closed while the connection was active");
+            }
         }
     }
 
-    pub async fn notify_reconnection(&self) {
-        info!("🔄 Input handler: Client reconnected, resetting state");
-
-        let pressed_keys = self.keyboard_handler.lock().await.get_pressed_keys();
-        for keycode in pressed_keys {
-            if let Err(error) = self
-                .session_handle
-                .notify_keyboard_keycode(keycode as i32, false)
-                .await
-            {
-                warn!(%error, keycode, "Failed to release key during reconnect");
-            }
+    fn fail_input_connection(&self, reason: &'static str) {
+        if !self.terminal_overflow.swap(true, Ordering::AcqRel) {
+            error!(reason, "Input queue entered a terminal state");
         }
-        let pressed_buttons = self.mouse_handler.lock().await.pressed_buttons();
-        for button in pressed_buttons {
-            if let Err(error) = self
-                .session_handle
-                .notify_pointer_button(button.to_linux_button() as i32, false)
-                .await
-            {
-                warn!(%error, ?button, "Failed to release pointer button during reconnect");
-            }
+        self.report_terminal_overflow_if_needed(reason);
+    }
+
+    fn report_terminal_overflow_if_needed(&self, reason: &str) {
+        report_input_failed_once(
+            &self.terminal_overflow,
+            &self.overflow_reported,
+            &self.health_reporter,
+            reason,
+        );
+    }
+
+    /// Wire input queue failures to session supervision.
+    pub fn set_health_reporter(&self, reporter: SessionStatusReporter) {
+        if let Ok(mut current) = self.health_reporter.write() {
+            *current = Some(reporter);
+        } else {
+            error!("Input health reporter lock is poisoned");
+            return;
         }
 
-        {
-            let mut keyboard = KeyboardHandler::new();
-            keyboard.set_layout(if self.keyboard_layout == "auto" {
-                "us"
-            } else {
-                &self.keyboard_layout
-            });
-            *self.keyboard_handler.lock().await = keyboard;
-        }
-        *self.mouse_handler.lock().await = MouseHandler::new();
+        self.report_terminal_overflow_if_needed(
+            "input event queue entered a terminal state before supervision was attached",
+        );
+    }
 
-        self.pointer_shape_sent.store(false, Ordering::Release);
-        debug!("Android pointer workaround state reset");
-
-        info!("✅ Input handler ready for reconnected client");
+    /// Whether this connection lost a release/synchronize event or its queue closed.
+    pub fn terminal_overflowed(&self) -> bool {
+        self.terminal_overflow.load(Ordering::Acquire)
     }
 
     /// Update coordinate transformer when monitor configuration changes
@@ -537,8 +663,9 @@ impl InputChannelHandler {
     /// This should be called when the RDP client requests a different resolution
     /// or when monitor configuration changes.
     pub async fn update_monitors(&self, monitors: Vec<MonitorInfo>) -> Result<(), InputError> {
-        let mut transformer = self.coordinate_transformer.lock().await;
-        *transformer = CoordinateTransformer::new(monitors)?;
+        let transformer = CoordinateTransformer::new(monitors.clone())?;
+        *self.monitors.lock().await = monitors;
+        *self.coordinate_transformer.lock().await = transformer;
         debug!("Updated monitor configuration");
         Ok(())
     }
@@ -577,31 +704,21 @@ impl InputChannelHandler {
         let rdp_height = rdp_height.max(1);
         let stream_width = stream_width.max(1);
         let stream_height = stream_height.max(1);
-        let monitor = MonitorInfo {
-            id: 0,
-            name: "Monitor 0".to_string(),
-            x: 0,
-            y: 0,
-            width: rdp_width,
-            height: rdp_height,
-            dpi: 96.0,
-            scale_factor: 1.0,
-            stream_x: 0,
-            stream_y: 0,
+        let mut monitors = self.monitors.lock().await.clone();
+        let mut streams = self.session_handle.streams();
+
+        update_primary_topology(
+            &mut monitors,
+            &mut streams,
+            self.primary_stream_id,
+            rdp_width,
+            rdp_height,
             stream_width,
             stream_height,
-            is_primary: true,
-        };
+        )?;
 
-        self.update_monitors(vec![monitor]).await?;
-        self.session_handle
-            .set_streams(vec![crate::rdp::session::backend::StreamInfo {
-                node_id: self.primary_stream_id,
-                width: stream_width,
-                height: stream_height,
-                position_x: 0,
-                position_y: 0,
-            }]);
+        self.update_monitors(monitors).await?;
+        self.session_handle.set_streams(streams);
 
         info!(
             "Updated direct input mapping: rdp {}x{} -> stream {}x{} for stream {}",
@@ -1216,18 +1333,18 @@ impl Clone for InputChannelHandler {
             keyboard_handler: Arc::clone(&self.keyboard_handler),
             mouse_handler: Arc::clone(&self.mouse_handler),
             coordinate_transformer: Arc::clone(&self.coordinate_transformer),
+            monitors: Arc::clone(&self.monitors),
             primary_stream_id: self.primary_stream_id,
             input_tx: self.input_tx.clone(),
-            queued_events: Arc::clone(&self.queued_events),
+            terminal_overflow: Arc::clone(&self.terminal_overflow),
+            overflow_reported: Arc::clone(&self.overflow_reported),
+            health_reporter: Arc::clone(&self.health_reporter),
             pointer_update_tx: self.pointer_update_tx.clone(),
             gfx_handler_state: self.gfx_handler_state.clone(),
             pointer_shape_sent: Arc::clone(&self.pointer_shape_sent),
             first_keyboard_event: Arc::clone(&self.first_keyboard_event),
             first_mouse_event: Arc::clone(&self.first_mouse_event),
             first_mouse_button_event: Arc::clone(&self.first_mouse_button_event),
-            keyboard_layout: self.keyboard_layout.clone(),
-            cjk_paste_enabled: self.cjk_paste_enabled,
-            clipboard_provider: self.clipboard_provider.clone(),
         }
     }
 }
@@ -1260,19 +1377,114 @@ mod tests {
     }
 
     #[test]
-    fn backlog_policy_never_drops_release_or_sync_events() {
-        assert!(!input_event_is_droppable(&InputEvent::Keyboard(
-            IronKeyboardEvent::Released {
+    fn queue_pressure_fails_for_release_and_synchronize_events() {
+        use ironrdp_pdu::input::fast_path::SynchronizeFlags;
+
+        assert_eq!(
+            queue_pressure_action(&InputEvent::Keyboard(IronKeyboardEvent::Released {
                 code: 0x1e,
-                extended: false
-            }
-        )));
-        assert!(!input_event_is_droppable(&InputEvent::Mouse(
-            IronMouseEvent::LeftReleased
-        )));
-        assert!(input_event_is_droppable(&InputEvent::Mouse(
-            IronMouseEvent::Move { x: 1, y: 1 }
-        )));
+                extended: false,
+            })),
+            QueuePressureAction::FailConnection
+        );
+        assert_eq!(
+            queue_pressure_action(&InputEvent::Keyboard(IronKeyboardEvent::Synchronize(
+                SynchronizeFlags::empty(),
+            ))),
+            QueuePressureAction::FailConnection
+        );
+        assert_eq!(
+            queue_pressure_action(&InputEvent::Mouse(IronMouseEvent::LeftReleased)),
+            QueuePressureAction::FailConnection
+        );
+        assert_eq!(
+            queue_pressure_action(&InputEvent::Mouse(IronMouseEvent::Move { x: 1, y: 1 })),
+            QueuePressureAction::Drop
+        );
+        assert_eq!(
+            queue_pressure_action(&InputEvent::Keyboard(IronKeyboardEvent::Pressed {
+                code: 0x1e,
+                extended: false,
+            })),
+            QueuePressureAction::Drop
+        );
+    }
+
+    #[test]
+    fn primary_mapping_update_preserves_monitor_and_stream_topology() {
+        let mut monitors = vec![
+            MonitorInfo {
+                id: 7,
+                name: "primary".to_string(),
+                x: 100,
+                y: 200,
+                width: 1920,
+                height: 1080,
+                dpi: 110.0,
+                scale_factor: 1.25,
+                stream_x: 10,
+                stream_y: 20,
+                stream_width: 1920,
+                stream_height: 1080,
+                is_primary: true,
+            },
+            MonitorInfo {
+                id: 8,
+                name: "secondary".to_string(),
+                x: 2020,
+                y: 200,
+                width: 1280,
+                height: 1024,
+                dpi: 96.0,
+                scale_factor: 1.0,
+                stream_x: 1930,
+                stream_y: 20,
+                stream_width: 1280,
+                stream_height: 1024,
+                is_primary: false,
+            },
+        ];
+        let mut streams = vec![
+            StreamInfo::new(71, 1920, 1080, 100, 200),
+            StreamInfo::new(72, 1280, 1024, 2020, 200),
+        ];
+
+        assert!(
+            update_primary_topology(&mut monitors, &mut streams, 71, 1600, 900, 2560, 1440).is_ok()
+        );
+
+        assert_eq!(monitors.len(), 2);
+        assert_eq!(monitors[0].id, 7);
+        assert_eq!(monitors[0].name, "primary");
+        assert_eq!((monitors[0].x, monitors[0].y), (100, 200));
+        assert_eq!((monitors[0].width, monitors[0].height), (1600, 900));
+        assert_eq!((monitors[0].stream_x, monitors[0].stream_y), (10, 20));
+        assert_eq!(
+            (monitors[0].stream_width, monitors[0].stream_height),
+            (2560, 1440)
+        );
+        assert_eq!(monitors[0].dpi, 110.0);
+        assert_eq!(monitors[0].scale_factor, 1.25);
+        assert!(monitors[0].is_primary);
+
+        assert_eq!(monitors[1].id, 8);
+        assert_eq!(monitors[1].name, "secondary");
+        assert_eq!((monitors[1].x, monitors[1].y), (2020, 200));
+        assert_eq!((monitors[1].width, monitors[1].height), (1280, 1024));
+        assert_eq!((monitors[1].stream_x, monitors[1].stream_y), (1930, 20));
+        assert_eq!(
+            (monitors[1].stream_width, monitors[1].stream_height),
+            (1280, 1024)
+        );
+        assert!(!monitors[1].is_primary);
+
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0].node_id, 71);
+        assert_eq!((streams[0].width, streams[0].height), (2560, 1440));
+        assert_eq!((streams[0].position_x, streams[0].position_y), (100, 200));
+        assert_eq!(streams[1].node_id, 72);
+        assert_eq!((streams[1].width, streams[1].height), (1280, 1024));
+        assert_eq!((streams[1].position_x, streams[1].position_y), (2020, 200));
     }
 
     #[test]
@@ -1301,5 +1513,58 @@ mod tests {
         let mut buf = CjkPasteBuffer::new();
         assert!(buf.is_empty());
         assert_eq!(buf.take_text(), None);
+    }
+
+    #[test]
+    fn injection_failure_threshold_is_terminal_only_at_limit() {
+        // Transient runs below the threshold keep retrying.
+        assert!(!injection_failures_are_terminal(0));
+        assert!(!injection_failures_are_terminal(1));
+        assert!(!injection_failures_are_terminal(
+            INPUT_FAILURE_THRESHOLD - 1
+        ));
+        // At and beyond the threshold the failure is permanent.
+        assert!(injection_failures_are_terminal(INPUT_FAILURE_THRESHOLD));
+        assert!(injection_failures_are_terminal(
+            INPUT_FAILURE_THRESHOLD + 100
+        ));
+    }
+
+    #[test]
+    fn report_input_failed_once_emits_permanent_failure_a_single_time() {
+        use crate::rdp::session::supervision::SessionSupervisor;
+
+        let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let (_, reporter, _) = SessionSupervisor::new(shutdown_tx.subscribe());
+
+        let terminal_overflow = AtomicBool::new(false);
+        let overflow_reported = AtomicBool::new(false);
+        let health_reporter = StdRwLock::new(Some(reporter));
+
+        // Not terminal yet: nothing is reported and the slot stays open.
+        report_input_failed_once(
+            &terminal_overflow,
+            &overflow_reported,
+            &health_reporter,
+            "still healthy",
+        );
+        assert!(!overflow_reported.load(Ordering::Acquire));
+
+        // Once terminal, the first call reports and the second is suppressed.
+        terminal_overflow.store(true, Ordering::Release);
+        report_input_failed_once(
+            &terminal_overflow,
+            &overflow_reported,
+            &health_reporter,
+            "permanent",
+        );
+        assert!(overflow_reported.load(Ordering::Acquire));
+        report_input_failed_once(
+            &terminal_overflow,
+            &overflow_reported,
+            &health_reporter,
+            "permanent again",
+        );
+        assert!(overflow_reported.load(Ordering::Acquire));
     }
 }
