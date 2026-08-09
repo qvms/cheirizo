@@ -4,6 +4,11 @@ WRDP is a single-port, multi-user RDP server for Linux servers running Wayland i
 
 It accepts an RDP connection, authenticates the user, starts or reuses that user's managed compositor session, applies the negotiated desktop size before capture, and sends display, input, audio and clipboard data through IronRDP.
 
+<figure>
+  <img src="docs/images/wrdp-minimal-desktop.png" alt="WRDP minimalist desktop with a Platinum-style taskbar, Thunar and Foot">
+  <figcaption>includes an opinionated minimalist desktop for testing</figcaption>
+</figure>
+
 ## Goals
 
 - One listener shared by multiple users.
