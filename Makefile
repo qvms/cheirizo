@@ -10,7 +10,7 @@ SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DEFAULT_GOAL := help
 
-RUST_VERSION ?= 1.94.0
+RUST_VERSION ?= 1.84.0
 FEATURES ?= default,vaapi
 WRDP_TMPDIR ?= $(CURDIR)/.local/tmp
 CARGO_TARGET_DIR ?= $(WRDP_TMPDIR)/wrdp-target
