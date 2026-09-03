@@ -144,7 +144,6 @@ libloading = { version = "0.8", optional = true }
 # -----------------------------------------------------------------------------
 # VA-API: Intel/AMD GPU encoding (ChromeOS bindings)
 # Requires libva-dev 1.20.0+ installed
-cros-libva = { version = "0.0.13", optional = true }
 
 # -----------------------------------------------------------------------------
 # System and utilities
@@ -226,10 +225,8 @@ h264-source = ["openh264", "libloading", "openh264/source"]
 # Hardware-accelerated H.264 encoding (premium feature)
 # VA-API: Intel (iHD/i965) and AMD (radeonsi) GPU encoding
 # Requires libva-dev and GPU drivers
-vaapi = ["cros-libva"]
 
 # Convenience: enable all hardware backends
-hardware-encoding = ["vaapi"]
 
 
 # Reserved feature slot (not implemented yet)
