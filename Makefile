@@ -11,7 +11,7 @@ SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := help
 
 RUST_VERSION ?= 1.84.0
-FEATURES ?= default,vaapi
+FEATURES ?= default
 WRDP_TMPDIR ?= $(CURDIR)/.local/tmp
 CARGO_TARGET_DIR ?= $(WRDP_TMPDIR)/wrdp-target
 COMPOSITOR_BUILD_DIR ?= $(WRDP_TMPDIR)/wrdp-compositor-build
