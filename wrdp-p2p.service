@@ -1,0 +1,16 @@
+[Unit]
+Description=WRDP WiFi-Direct (P2P) Group Owner
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/wpa_cli -i wlp7s0 p2p_group_add
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/ip addr add 192.168.4.1/24 dev p2p-wlp7s0-0
+ExecStart=/usr/bin/ip link set p2p-wlp7s0-0 up
+ExecStop=/usr/bin/wpa_cli -i wlp7s0 p2p_group_remove p2p-wlp7s0-0
+
+[Install]
+WantedBy=multi-user.target

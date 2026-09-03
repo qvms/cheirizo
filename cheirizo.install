@@ -1,0 +1,11 @@
+post_install() {
+    echo "Running autopostbuild to generate configs and certs..."
+    /usr/local/bin/wrdp-autopostbuild.sh
+    systemctl daemon-reload
+    systemctl enable --now wrdp-p2p.service
+    systemctl enable --now wrdp.socket
+}
+
+post_upgrade() {
+    post_install
+}

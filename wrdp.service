@@ -1,0 +1,18 @@
+[Unit]
+Description=WRDP Wayland RDP daemon
+Requires=wrdp.socket wrdp-p2p.service
+After=network.target wrdp-p2p.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wrdp --config /etc/wrdp/wrdp.ini
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=wrdp
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+ReadWritePaths=/run/wrdp /run/user
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
