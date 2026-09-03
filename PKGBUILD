@@ -3,7 +3,7 @@ pkgver=0.1.0
 pkgrel=1
 pkgdesc="A single-port, multi-user RDP server for Linux servers running Wayland in headless mode"
 arch=('x86_64')
-url="https://github.com/scrabbles/cheirizo"
+url="https://github.com/qvms/cheirizo"
 license=('MIT' 'GPL-2.0-only')
 depends=( 'dnsmasq' 'wayland' 'openssl' 'pam' 'pipewire' 'xorg-xwayland' 'wpa_supplicant' 'pixman' 'cairo' 'pango' 'libxkbcommon' 'glib2' 'libxml2' 'libdrm')
 makedepends=( 'dnsmasq' 'cargo' 'meson' 'ninja' 'python-yaml' 'wayland-protocols' 'cmake' 'pkgconf')
@@ -46,5 +46,6 @@ package() {
   install -m 0644 wrdp.socket "${pkgdir}/etc/systemd/system/"
   install -m 0644 wrdp.service "${pkgdir}/etc/systemd/system/"
   install -m 0644 wrdp-p2p.service "${pkgdir}/etc/systemd/system/"
+  install -m 0644 "$startdir/dnsmasq-p2p.conf" "${pkgdir}/etc/wrdp/"
   install -m 0755 autopostbuild.sh "${pkgdir}/usr/local/bin/wrdp-autopostbuild.sh"
 }
