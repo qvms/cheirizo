@@ -10,9 +10,8 @@ ExecStartPre=/usr/bin/wpa_cli -i wlp7s0 p2p_group_add
 ExecStartPre=/bin/sleep 2
 ExecStart=/usr/bin/ip addr add 192.168.4.1/24 dev p2p-wlp7s0-0
 ExecStart=/usr/bin/ip link set p2p-wlp7s0-0 up
-ExecStartPost=/usr/bin/dnsmasq -C /etc/dnsmasq-p2p.conf -x /run/dnsmasq-p2p.pid
-ExecStopPost=/usr/bin/kill -9 $$(cat /run/dnsmasq-p2p.pid)
-ExecStop=/usr/bin/wpa_cli -i wlp7s0 p2p_group_remove p2p-wlp7s0-0
+ExecStartPost=/usr/bin/dnsmasq -C /etc/wrdp/dnsmasq-p2p.conf -x /run/wrdp-dnsmasq-p2p.pid
+ExecStopPost=/usr/bin/wpa_cli -i wlp7s0 p2p_group_remove p2p-wlp7s0-0
 
 [Install]
 WantedBy=multi-user.target
